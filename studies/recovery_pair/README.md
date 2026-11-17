@@ -389,9 +389,30 @@ computed by the same rule from the file times of its trainings' launch and check
 from-launch times at its criteria and the trainer's own totals, which start about 20 s later. By the NablaMimic study's
 control criterion (the first save on its grid, every 500 iterations here and 250 updates there, with C ≥ 38 and
 E ≤ 0.0341 m), a control first tracks at 3,000 iterations here, 986 and 981 s from launch, and at 1,750 updates there,
-1,107 and 1,105 s: ratios 0.89 and 0.89. Both trainers started with empty compile caches; this trainer's start-up is
-about 600 s (table above), and no time with a pre-built cache is measured here. NablaMimic's recovery criterion (R ≥ 50,
-R at least the larger control R at the last save plus 20, J over R ≥ 0.5) needs R ≥ 111 here, so it gives no time.
+1,107 and 1,105 s: ratios 0.89 and 0.89. Both trainers started with empty compile caches. NablaMimic's recovery
+criterion (R ≥ 50, R at least the larger control R at the last save plus 20, J over R ≥ 0.5) needs R ≥ 111 here, so it
+gives no time.
+
+**With pre-built compile caches (exploratory).** For each trainer and condition at seed 0, a short training of the
+same configuration (100 iterations here, 250 updates there) filled the compile caches from empty; they were archived
+and unpacked in another container on the same card, where the training command of the pair then ran unchanged. One
+training per cell; the first value is the pair's training from empty caches, the second the one with the caches:
+
+| Training, seed 0 | Launch to the last checkpoint (s) | Start-up (s) | Steady (s per iteration or update) |
+| --- | --- | --- | --- |
+| control, here | 1,504.8 / 956.1 | 598.2 / 47.5 | 0.1295 / 0.1298 |
+| recovery, here | 1,546.1 / 991.4 | 605.8 / 50.3 | 0.1343 / 0.1345 |
+| control, NablaMimic | 1,784.0 / 1,656.6 | 157.2 / 34.6 | 0.5423 / 0.5407 |
+| recovery, NablaMimic | 1,803.9 / 1,665.1 | 170.0 / 35.1 | 0.5446 / 0.5433 |
+
+With the caches this trainer compiled none of its 44 Warp modules and its cache folder (1.1 GB) did not grow;
+NablaMimic's trainer read 11 of 11 graph-cache hits and 7 of 7 autograd-cache hits, did not build its engine library,
+and its cache folder (0.3 GB) did not grow. The ratio of this trainer's seconds to NablaMimic's, launch to the last
+checkpoint, is 0.84 (control) and 0.86 (recovery) from empty caches and 0.58 and 0.60 with them. The saves of these
+trainings were not rolled out, so no time to a criterion is read from them; the save at which the pair's control of
+seed 0 first tracked was written at 436 s here (iteration 3,000) and at 980 s there (1,750 updates). A cache built on
+one card model was not fully used on another (the Warp modules loaded on a card of the same compute capability and
+were compiled again on one of another), so a cache is built per card model.
 
 **Repeated rollouts of one checkpoint (exploratory).** Control seed 0 and recovery seed 0 at 7,000 each have three
 further sets of three rollouts (placed starts, twins, first rows) on the same scene files, read by `readings.py`; the
@@ -464,4 +485,5 @@ cause of these ends is not established.
   are not part of the outcome.
 - A cause of the ends on get-up clips, or a rate of them with an interval: the repeated rollouts are of one checkpoint
   per condition, at seed 0.
-- The times hold for one card, the RTX 4090 with 48 GB at 350 W, with empty compile caches.
+- The times hold for one card, the RTX 4090 with 48 GB at 350 W; the trainings with pre-built caches are one run per
+  condition at seed 0, and their saves are not read.
