@@ -171,6 +171,8 @@ class MotionLib:
         if bones_list:
             return cls.from_bones(bones_lib or BONES_LIB, bones_list, kin, device)
         files = sorted(glob.glob(os.path.join(motion_dir or robot.motion_dir, robot.motion_glob)))
+        if not files:
+            raise FileNotFoundError(f"no {robot.motion_glob} files in {motion_dir or robot.motion_dir}")
         return cls(files, kin, device, robot.load_motion)
 
     def set_ref_contact(self, feet: list[int], margin: float = 0.015, vmax: float = 0.5, q: float = 0.05) -> None:
