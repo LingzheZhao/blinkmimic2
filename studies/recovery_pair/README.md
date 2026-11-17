@@ -266,13 +266,13 @@ reading test gives the entry a stand-in for `readings_core.py`, so it needs no N
 
 **Conditions.** The trainings, scene, rollouts, readings and outcome ran at revision f29424a6666c of this repository,
 whose `src`, `scripts` and `tools` are those of pull request 2 (f7e140c); the reading rules are NablaMimic's
-`readings_core.py` at 369a2833050b. Every training and the rollouts of the eight declared saves ran on one NVIDIA
-GeForce RTX 4090 with 48 GB under a 350 W power limit, with empty compile caches at each start, on MuJoCo Warp 3.11.0
-through mjlab 1.6.0 with 128 contacts per world (pooled) and 500 constraint rows; the largest counts in a rollout of the
-eight saves are 38 contacts and 152 constraint rows, and no trial exceeded the capacity. Control seed 1's saves other
-than 3,500 and 7,000 were rolled out on an NVIDIA RTX 6000 Ada. Every training completed its 7,000 iterations. No
-training, rollout or reading failed or was skipped. Three further sets of three rollouts (placed starts, twins, first
-rows) of two saves, 18 rollouts in all (below), ran at the same revision on an RTX 4090 with 48 GB; none failed.
+`readings_core.py` at 369a2833050b. The pair's four trainings and the rollouts of the eight declared saves ran on one
+NVIDIA GeForce RTX 4090 with 48 GB, with empty compile caches at each start, on MuJoCo Warp 3.11.0 through mjlab 1.6.0
+with 128 contacts per world (pooled) and 500 constraint rows; the largest counts in a rollout of the eight saves are 38
+contacts and 152 constraint rows, and no trial exceeded the capacity. Control seed 1's saves other than 3,500 and 7,000
+were rolled out on an NVIDIA RTX 6000 Ada. Every training completed its 7,000 iterations. No training, rollout or
+reading failed or was skipped. Three further sets of three rollouts (placed starts, twins, first rows) of two saves, 18
+rollouts in all (below), ran at the same revision on an RTX 4090 with 48 GB; none failed.
 
 | Save | Get up of 100 (R) | Rejoin of 100 (J) | Rejoined over got up (readable) | Twins that fall (F) | Clips completed of 40 (C) | Body-position error E (m) |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -331,41 +331,45 @@ iterations, and the completed clips differ (36 against 38, 39 against 40).
 same scene files. `readings.py` read the controls' 28 saves and the recovery runs' four declared saves. The recovery
 runs' 24 other saves were read from placed starts and twins only, with the same `readings_core.py` called by a program
 that is not part of this repository, so they have no C, no E and no record of contact or constraint capacity. Each
-cell gives R / C / E (m) and the seconds from launch to the checkpoint's file time for a control, and R for a recovery
-run:
+cell gives, for a control, R / C / E (m) and the seconds from launch at which the timing training of the same condition
+and seed wrote that checkpoint ("Training time" below), and R for a recovery run:
 
 | Iterations | control, seed 0 | control, seed 1 | recovery, seed 0 | recovery, seed 1 |
 | --- | --- | --- | --- | --- |
-| 500 | 10 / 13 / 0.1008, 663 s | 9 / 1 / 0.1094, 658 s | 3 | 2 |
-| 1,000 | 26 / 26 / 0.0652, 728 s | 27 / 26 / 0.0619, 723 s | 8 | 5 |
-| 1,500 | 93 / 33 / 0.0466, 792 s | 98 / 32 / 0.0472, 787 s | 59 | 56 |
-| 2,000 | 98 / 36 / 0.0390, 857 s | 92 / 36 / 0.0390, 852 s | 87 | 82 |
-| 2,500 | 97 / 37 / 0.0343, 922 s | 95 / 35 / 0.0367, 917 s | 87 | 95 |
-| 3,000 | 93 / 39 / 0.0331, 986 s | 93 / 39 / 0.0337, 981 s | 96 | 97 |
-| 3,500 | 93 / 39 / 0.0321, 1,051 s | 97 / 37 / 0.0332, 1,046 s | 95 | 99 |
-| 4,000 | 90 / 40 / 0.0313, 1,115 s | 83 / 38 / 0.0325, 1,111 s | 98 | 98 |
-| 4,500 | 75 / 40 / 0.0306, 1,180 s | 83 / 38 / 0.0321, 1,175 s | 99 | 98 |
-| 5,000 | 58 / 38 / 0.0306, 1,245 s | 96 / 40 / 0.0317, 1,240 s | 98 | 97 |
-| 5,500 | 85 / 40 / 0.0297, 1,309 s | 81 / 40 / 0.0306, 1,305 s | 99 | 99 |
-| 6,000 | 76 / 40 / 0.0299, 1,374 s | 89 / 40 / 0.0300, 1,369 s | 98 | 98 |
-| 6,500 | 62 / 39 / 0.0295, 1,438 s | 87 / 40 / 0.0294, 1,434 s | 98 | 98 |
-| 7,000 | 60 / 40 / 0.0296, 1,505 s | 91 / 39 / 0.0292, 1,500 s | 99 | 97 |
+| 500 | 10 / 13 / 0.1008, 564 s | 9 / 1 / 0.1094, 567 s | 3 | 2 |
+| 1,000 | 26 / 26 / 0.0652, 622 s | 27 / 26 / 0.0619, 627 s | 8 | 5 |
+| 1,500 | 93 / 33 / 0.0466, 681 s | 98 / 32 / 0.0472, 686 s | 59 | 56 |
+| 2,000 | 98 / 36 / 0.0390, 740 s | 92 / 36 / 0.0390, 746 s | 87 | 82 |
+| 2,500 | 97 / 37 / 0.0343, 798 s | 95 / 35 / 0.0367, 805 s | 87 | 95 |
+| 3,000 | 93 / 39 / 0.0331, 857 s | 93 / 39 / 0.0337, 864 s | 96 | 97 |
+| 3,500 | 93 / 39 / 0.0321, 916 s | 97 / 37 / 0.0332, 924 s | 95 | 99 |
+| 4,000 | 90 / 40 / 0.0313, 974 s | 83 / 38 / 0.0325, 983 s | 98 | 98 |
+| 4,500 | 75 / 40 / 0.0306, 1,033 s | 83 / 38 / 0.0321, 1,043 s | 99 | 98 |
+| 5,000 | 58 / 38 / 0.0306, 1,092 s | 96 / 40 / 0.0317, 1,102 s | 98 | 97 |
+| 5,500 | 85 / 40 / 0.0297, 1,150 s | 81 / 40 / 0.0306, 1,161 s | 99 | 99 |
+| 6,000 | 76 / 40 / 0.0299, 1,209 s | 89 / 40 / 0.0300, 1,220 s | 98 | 98 |
+| 6,500 | 62 / 39 / 0.0295, 1,268 s | 87 / 40 / 0.0294, 1,280 s | 98 | 98 |
+| 7,000 | 60 / 40 / 0.0296, 1,327 s | 91 / 39 / 0.0292, 1,339 s | 99 | 97 |
 
 The controls get up from 92 to 98 of 100 at every save from 1,500 to 3,500 iterations. At seed 0, from 4,000 on, the
 control's R lies between 58 and 90 and is 60 at 7,000, while its E lies between 0.0295 and 0.0313 m.
 
-**Training time.** Seconds from `process_start.txt` to the file time of `ckpt_007000.pt`; the steady rate, between the
-first and the last numbered checkpoint; and the start-up, the first numbered checkpoint's time (606 to 619 s from
-launch) minus its 100 iterations at the steady rate:
+**Training time.** The times come from timing trainings: the pair's training commands and seeds run again from empty
+compile caches, each on one NVIDIA GeForce RTX 4090 with 48 GB at a 450 W power limit in a host with two 64-core CPUs,
+four trainings at once beside other jobs on the host; their saves are not read. The pair's own trainings ran on a card
+of the same model under a lower power limit, and their times are not used. The table gives the seconds from
+`process_start.txt` to the file time of `ckpt_007000.pt`; the steady rate, between the first and the last numbered
+checkpoint; and the start-up, the first numbered checkpoint's time (iteration 100, 517 to 529 s from launch) minus its
+100 iterations at the steady rate:
 
 | Training | Launch to the last checkpoint (s) | Start-up (s) | Steady (s per iteration) |
 | --- | --- | --- | --- |
-| control, seed 0 | 1,504.8 | 598.2 | 0.1295 |
-| control, seed 1 | 1,500.5 | 593.1 | 0.1296 |
-| recovery, seed 0 | 1,546.1 | 605.8 | 0.1343 |
-| recovery, seed 1 | 1,544.1 | 603.5 | 0.1344 |
+| control, seed 0 | 1,326.9 | 505.0 | 0.1174 |
+| control, seed 1 | 1,339.4 | 507.6 | 0.1188 |
+| recovery, seed 0 | 1,362.5 | 513.5 | 0.1213 |
+| recovery, seed 1 | 1,388.9 | 516.3 | 0.1247 |
 
-The four trainings together take 6,095.5 s.
+The times of the four timing trainings sum to 5,417.7 s.
 
 **Beside the NablaMimic study.** The final saves of both studies:
 
@@ -382,37 +386,39 @@ rule lands on other rows, and in the unit of training (iterations against update
 training. C and the span over which E is averaged follow each trainer's termination: the same formula, each against
 its own library's rows ("Ends on get-up clips" below).
 
-On the same card, from launch to the last checkpoint, NablaMimic's trainings take 1,784 and 1,781 s (control, seeds 0
-and 1) and 1,804 and 1,806 s (recovery); against this study's totals above the ratios, taken before the seconds are
-rounded, are 0.84, 0.84, 0.86 and 0.86 (the printed seconds give 0.855 for recovery seed 1). NablaMimic's seconds are
-computed by the same rule from the file times of its trainings' launch and checkpoints; its README gives only the
-from-launch times at its criteria and the trainer's own totals, which start about 20 s later. By the NablaMimic study's
-control criterion (the first save on its grid, every 500 iterations here and 250 updates there, with C ≥ 38 and
-E ≤ 0.0341 m), a control first tracks at 3,000 iterations here, 986 and 981 s from launch, and at 1,750 updates there,
-1,107 and 1,105 s: ratios 0.89 and 0.89. Both trainers started with empty compile caches. NablaMimic's recovery
-criterion (R ≥ 50, R at least the larger control R at the last save plus 20, J over R ≥ 0.5) needs R ≥ 111 here, so it
-gives no time.
+On a card of the same model and power limit, from launch to the last checkpoint, the NablaMimic study's training
+commands, run again in the same way, take 1,458 and 1,450 s (control, seeds 0 and 1) and 1,462 and 1,500 s (recovery);
+against this study's totals above the ratios, taken before the seconds are rounded, are 0.91, 0.92, 0.93 and 0.93.
+NablaMimic's seconds are computed by the same rule from the file times of these trainings' launch and checkpoints; its
+README gives only the from-launch times at its criteria and the trainer's own totals, which start about 20 s later. By
+the NablaMimic study's control criterion (the first save on its grid, every 500 iterations here and 250 updates there,
+with C ≥ 38 and E ≤ 0.0341 m), a control first tracks at 3,000 iterations here and at 1,750 updates there; the timing
+trainings wrote those checkpoints 857 and 864 s from launch here and 908 and 904 s there: ratios 0.94 and 0.96. Both
+trainers started with empty compile caches. NablaMimic's recovery criterion (R ≥ 50, R at least the larger control R
+at the last save plus 20, J over R ≥ 0.5) needs R ≥ 111 here, so it gives no time.
 
 **With pre-built compile caches (exploratory).** For each trainer and condition at seed 0, a short training of the
 same configuration (100 iterations here, 250 updates there) filled the compile caches from empty; they were archived
-and unpacked in another container on the same card, where the training command of the pair then ran unchanged. One
-training per cell; the first value is the pair's training from empty caches, the second the one with the caches:
+and unpacked in another container on a card of the same model and power limit, where the training command of the pair
+then ran unchanged. One training per cell; the first value is the timing training from empty caches, the second the one
+with the caches:
 
 | Training, seed 0 | Launch to the last checkpoint (s) | Start-up (s) | Steady (s per iteration or update) |
 | --- | --- | --- | --- |
-| control, here | 1,504.8 / 956.1 | 598.2 / 47.5 | 0.1295 / 0.1298 |
-| recovery, here | 1,546.1 / 991.4 | 605.8 / 50.3 | 0.1343 / 0.1345 |
-| control, NablaMimic | 1,784.0 / 1,656.6 | 157.2 / 34.6 | 0.5423 / 0.5407 |
-| recovery, NablaMimic | 1,803.9 / 1,665.1 | 170.0 / 35.1 | 0.5446 / 0.5433 |
+| control, here | 1,326.9 / 883.1 | 505.0 / 47.8 | 0.1174 / 0.1193 |
+| recovery, here | 1,362.5 / 906.0 | 513.5 / 48.0 | 0.1213 / 0.1226 |
+| control, NablaMimic | 1,458.1 / 1,321.6 | 137.1 / 28.3 | 0.4403 / 0.4311 |
+| recovery, NablaMimic | 1,462.4 / 1,358.4 | 146.7 / 29.8 | 0.4385 / 0.4429 |
 
 With the caches this trainer compiled none of its 44 Warp modules and its cache folder (1.1 GB) did not grow;
 NablaMimic's trainer read 11 of 11 graph-cache hits and 7 of 7 autograd-cache hits, did not build its engine library,
 and its cache folder (0.3 GB) did not grow. The ratio of this trainer's seconds to NablaMimic's, launch to the last
-checkpoint, is 0.84 (control) and 0.86 (recovery) from empty caches and 0.58 and 0.60 with them. The saves of these
-trainings were not rolled out, so no time to a criterion is read from them; the save at which the pair's control of
-seed 0 first tracked was written at 436 s here (iteration 3,000) and at 980 s there (1,750 updates). A cache built on
-one card model was not fully used on another (the Warp modules loaded on a card of the same compute capability and
-were compiled again on one of another), so a cache is built per card model.
+checkpoint, is 0.91 (control) and 0.93 (recovery) from empty caches and 0.67 and 0.67 with them. As with the timing
+trainings, the saves of these trainings were not rolled out; the pair's control of seed 0 first tracked at iteration
+3,000 here and at 1,750 updates there, and the training with the caches of that condition and seed wrote its checkpoint
+of the same iteration at 406 s here and at 784 s there. A cache built on one card model was not fully used on another
+(the Warp modules loaded on a card of the same compute capability and were compiled again on one of another), so a
+cache is built per card model.
 
 **Repeated rollouts of one checkpoint (exploratory).** Control seed 0 and recovery seed 0 at 7,000 each have three
 further sets of three rollouts (placed starts, twins, first rows) on the same scene files, read by `readings.py`; the
@@ -485,5 +491,6 @@ cause of these ends is not established.
   are not part of the outcome.
 - A cause of the ends on get-up clips, or a rate of them with an interval: the repeated rollouts are of one checkpoint
   per condition, at seed 0.
-- The times hold for one card, the RTX 4090 with 48 GB at 350 W; the trainings with pre-built caches are one run per
-  condition at seed 0, and their saves are not read.
+- The times hold for one card model and power limit, the RTX 4090 with 48 GB at 450 W, four trainings at once beside
+  other jobs on the host, and come from timing trainings whose saves are not read; the trainings with pre-built caches
+  are one run per condition at seed 0.
