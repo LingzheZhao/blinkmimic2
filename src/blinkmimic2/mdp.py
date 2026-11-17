@@ -114,12 +114,17 @@ class MDP:
         return o + (2 * torch.rand_like(o) - 1) * self.obs_noise
 
     # ---------------- reward / termination ----------------
-    def reward(self, S, f, a, a_prev, terms: bool = False, w_contact: float = 0.0):
+    def reward(self, S, f, a, a_prev, terms: bool = False, w_contact: float = 0.0, recovery=None):
         """Per-step reward (already multiplied by dt) comparing S with reference frame f.
 
         ``w_contact`` > 0 adds a contact term: a smooth foot-contact indicator (ankle-roll
         origin below 4.5 cm) matched to the reference's contact state, plus low horizontal foot speed while
-        the reference foot is down. Evaluation keeps ``w_contact = 0``, i.e. the paper's reward."""
+        the reference foot is down. Evaluation keeps ``w_contact = 0``, i.e. the paper's reward.
+
+        ``recovery`` (recovery training, recovery.py): (scale [B], height_only [B] bool, root_offset [B, 2]). The six
+        tracking terms are multiplied by ``scale``; the root position error is that of the reference root moved by
+        the planar ``root_offset``, its height alone where ``height_only``. The penalties and the contact term are
+        unchanged."""
         c, m = self.cfg, self.motion
         p, R, v, w, q, qd = S
         bp, bR, bv, bw = self.kin.forward(p, R, v, w, q, qd)
@@ -135,6 +140,10 @@ class MDP:
         e_lv = ((rbv - bv) ** 2).sum(-1).mean(-1)
         e_av = ((rbw - bw) ** 2).sum(-1).mean(-1)
         e_rp = ((rp - p) ** 2).sum(-1)
+        if recovery is not None:
+            scale, height_only, root_offset = recovery
+            d_rp = (rp + torch.nn.functional.pad(root_offset, (0, 1)) - p) ** 2
+            e_rp = torch.where(height_only, d_rp[..., 2], d_rp.sum(-1))
         e_ro = rot_angle_sq(rR, R)
         r_track = (
             torch.exp(-e_pos / c.body_pos_std**2)
@@ -144,6 +153,8 @@ class MDP:
             + 0.5 * torch.exp(-e_rp / c.root_pos_std**2)
             + 0.5 * torch.exp(-e_ro / c.root_ori_std**2)
         )
+        if recovery is not None:
+            r_track = r_track * scale
         r_rate = ((a - a_prev) ** 2).sum(-1)
         r_lim = (torch.relu(q - self.soft_hi) + torch.relu(self.soft_lo - q)).sum(-1)
         r = (r_track + c.w_action_rate * r_rate + c.w_joint_limit * r_lim) * CONTROL_DT
@@ -192,8 +203,9 @@ class MDP:
         alive = (1 - torch.sigmoid((e_z - scale * self.cfg.term_height) / tz)) * (1 - torch.sigmoid((e_tilt - scale * self.cfg.term_tilt) / tt))
         return 1 - alive
 
-    def critic_features(self, S, f, xi) -> torch.Tensor:
-        """Critic input: invariant state, goal, sim context, and robot-vs-reference errors."""
+    def critic_features(self, S, f, xi, root_offset=None) -> torch.Tensor:
+        """Critic input: invariant state, goal, sim context, and robot-vs-reference errors. ``root_offset`` (recovery
+        training, [B, 2]) moves the reference root of the root position error in the plane."""
         m = self.motion
         p, R, v, w, q, qd = S
         H = yaw_mat(R)
@@ -205,5 +217,7 @@ class MDP:
         ref_bp = anchor.unsqueeze(-2) + mv3(dR.unsqueeze(-3), m.ref_bodies(f)[0] - rp.unsqueeze(-2))
         e_body = mv3(Ht.unsqueeze(-3), ref_bp - bp).flatten(-2)
         e_root = mv3(Ht, rp - p)
+        if root_offset is not None:
+            e_root = mv3(Ht, rp + torch.nn.functional.pad(root_offset, (0, 1)) - p)
         rel = mat_to_6d(mm3(R.transpose(-1, -2), rR))
         return torch.cat((invariant_features(S), m.q[f] - q, e_body, e_root, rel, xi), -1)

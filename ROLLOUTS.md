@@ -37,7 +37,8 @@ python tools/rollouts.py --run_dir logs/run_s1 --ckpt 6500 --scene scene.json --
 ## Environment and policy
 
 The simulator is `TrackingSim(make_sim(robot), T, robot, motion, mdp, "cuda:0", eval_mode=True)`, as
-`tools/evaluate.py` builds it, with T the number of trials:
+`tools/evaluate.py` builds it, with T the number of trials, and never with the recovery options of
+[RECOVERY.md](RECOVERY.md), whatever the run's `args.json` holds:
 
 - The release's solver settings and capacities: per world 128 contacts (`nconmax`; MuJoCo Warp pools them into one
   array of 128 x T contacts for the batch) and 500 constraint rows (`njmax`).

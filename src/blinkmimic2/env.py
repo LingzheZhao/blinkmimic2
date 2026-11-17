@@ -17,6 +17,7 @@ from mjlab.scene import Scene, SceneCfg
 from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
 
+from . import recovery as recovery_rules
 from .dr import DomainRandCfg, DomainRandomizer, XiLayout
 from .mdp import MAX_STEP_REWARD, MDP, flatten_state
 from .motion import CONTROL_DT, MotionLib
@@ -136,10 +137,12 @@ class TrackingSim:
 
     def __init__(self, sim_cfg: SimulationCfg, num_envs: int, robot: RobotSpec, motion: MotionLib, mdp: MDP,
                  device: str, gamma: float = 0.99, eval_mode: bool = False, max_episode_steps: int = 500,
-                 reset_noise: bool = True, randomize: bool | None = None, fail_reset: float = 0.0, bin_fix: bool = False):  # fmt: skip
+                 reset_noise: bool = True, randomize: bool | None = None, fail_reset: float = 0.0, bin_fix: bool = False,
+                 recovery: recovery_rules.Recovery | None = None):  # fmt: skip
         """``randomize`` (default: not eval_mode) switches domain randomization, observation noise and
         delay, and pushes; ``eval_mode`` switches evaluation bookkeeping (no auto-reset, episode starts
-        exactly on the reference)."""
+        exactly on the reference). ``recovery`` (train.py's recovery options, recovery.py): recovery starts among the
+        sampled resets, and the reward and termination of recovery.advance."""
         self.device = device
         self.scene = Scene(make_scene_cfg(robot, num_envs), device=device)
         self.sim = Simulation(num_envs=num_envs, cfg=sim_cfg, model=self.scene.compile(), device=device)
@@ -213,6 +216,13 @@ class TrackingSim:
         self.bin_prev = torch.where((prev >= 0) & (motion.bin_clip[prev.clamp(min=0)] == motion.bin_clip), prev, prev + 1)
         self.done_eval = torch.zeros(self.N, dtype=torch.bool, device=dev)
         self.failed_eval = torch.zeros(self.N, dtype=torch.bool, device=dev)
+        # recovery training: the regime of each world's state (recovery.KEYS) and whether its episode is a recovery
+        # start; allocated once and written in place (the captured collection step reads and writes these tensors)
+        self.recovery = recovery
+        if recovery is not None:
+            zero = torch.zeros(self.N, dtype=torch.long, device=dev)
+            self.regime = recovery_rules.start_state(zero, zero)
+            self.recovery_episode = torch.zeros(self.N, dtype=torch.bool, device=dev)
         self.reset(torch.arange(self.N, device=dev))
 
     @property
@@ -349,12 +359,15 @@ class TrackingSim:
               body_frames: torch.Tensor | None = None):  # fmt: skip
         """Start episodes in the worlds ``env_ids``: the command (the reference row the world tracks, ``f``) starts at
         ``frames`` (default: sampled) and the body is placed at the reference state of ``body_frames`` (default:
-        ``frames``) with the offsets of :func:`placed_state` (``uniforms``, else the reset noise)."""
+        ``frames``) with the offsets of :func:`placed_state` (``uniforms``, else the reset noise). With recovery,
+        sampled resets include recovery starts (recovery.draw, after the reset rows) and the regime is written."""
         if len(env_ids) == 0:
             return
         n = len(env_ids)
         if frames is None:
             frames, bins = self.sample_frames(n)
+            if self.recovery is not None:
+                frames, bins, body_frames = recovery_rules.draw(self.recovery, frames, bins, self.motion.frame_bin)
         else:
             bins = self.motion.frame_bin[frames]
         m = self.motion
@@ -383,6 +396,10 @@ class TrackingSim:
         self.ep_ret.index_fill_(0, env_ids, 0.0)
         self.randomizer.reset(self.xi, env_ids)  # after scene.reset, which would restore actuator defaults
         self.obs_fresh.index_fill_(0, env_ids, True)
+        if self.recovery is not None:
+            for k, v in recovery_rules.start_state(frames if body_frames is None else body_frames, frames).items():
+                self.regime[k][env_ids] = v
+            self.recovery_episode[env_ids] = self.regime["recovering"][env_ids]
 
     def use_static_focus(self):
         """Keep the focus distribution and share in fixed device tensors (updated in place by set_focus), so a captured
@@ -402,12 +419,15 @@ class TrackingSim:
         it can be captured in a CUDA graph). Worlds outside the mask are left bitwise unchanged; the reset worlds get the
         same values as reset() would give them for the same frames and random draws (random draws are made for all
         worlds, so the random stream differs from reset()). Only the configuration used here is supported: no pushes,
-        no sensing state, no per-episode mjlab randomization terms, no actuator delays, no audit."""
+        no sensing state, no per-episode mjlab randomization terms, no actuator delays, no audit. With recovery, the
+        recovery draws (recovery.draw) follow the reset rows, the body is placed at the body rows and the regime of
+        the reset worlds is written."""
         assert not self.eval_mode and self.audit is None and not self.pipe.stateful and not self.push_enabled
         assert not self.randomizer._terms and self.spec.dr.solref_geoms is None and self.spec.dr.com_mass_range is None
         N, dev, m, c = self.N, self.device, self.motion, self.spec.dr
         d = mask
         d1 = d.unsqueeze(-1)
+        body = None
         if frames is None:
             frames, bins = self.sample_frames(N, gate=d.any())
             if self.det is not None:  # detector episodes start from det_q (uniform coverage + nominated places)
@@ -424,9 +444,11 @@ class TrackingSim:
                 ef = m.clip_start[ec]
                 ef, eb = torch.where(ex, ef, frames[N - n :]), torch.where(ex, m.frame_bin[ef], bins[N - n :])
                 frames, bins = torch.cat((frames[: N - n], ef)), torch.cat((bins[: N - n], eb))
+            if self.recovery is not None:
+                frames, bins, body = recovery_rules.draw(self.recovery, frames, bins, m.frame_bin)
         else:
             bins = m.frame_bin[frames]
-        clean = tuple(x.clone() for x in m.ref_state(frames))
+        clean = tuple(x.clone() for x in m.ref_state(frames if body is None else body))
         p, R, v, w, q, qd = placed_state(clean, c, self.reset_noise)
         if self.reset_noise and self.det_nominal:  # detectors start exactly on the reference, as the evaluation
             dn = self.det.view(-1, *([1] * (R.dim() - 1)))
@@ -465,6 +487,10 @@ class TrackingSim:
                 mid = mid & self.aprev_gate
             self.a_prev.copy_(torch.where(mid.unsqueeze(-1), (q - self.default_q) / self.alpha, self.a_prev))
         self.start_bin.copy_(torch.where(d, bins, self.start_bin))
+        if self.recovery is not None:
+            for k, v in recovery_rules.start_state(frames if body is None else body, frames).items():
+                self.regime[k].copy_(torch.where(d.view(-1, *([1] * (v.dim() - 1))), v, self.regime[k]))
+            self.recovery_episode.copy_(torch.where(d, self.regime["recovering"], self.recovery_episode))
         self.ep_disc_ret.masked_fill_(d, 0.0)
         self.ep_ret.masked_fill_(d, 0.0)
         self.randomizer.reset_masked(self.xi, d)
@@ -475,7 +501,8 @@ class TrackingSim:
 
     def step_tail_masked(self, out: dict) -> dict:
         """step_tail() without host-side ids (capturable): bin statistics of the ended episodes and reset_masked. Instead
-        of per-episode tensors, out gets n_done and the sums ep_len_sum / ep_ret_norm_sum over the ended episodes."""
+        of per-episode tensors, out gets n_done and the sums ep_len_sum / ep_ret_norm_sum over the ended episodes. With
+        recovery, recovery episodes stay outside the bin statistics but are counted in the sums."""
         assert self.bin_fix, "reset_masked needs --bin_fix (the index_put_ update keeps an arbitrary episode per bin)"
         done, term, f = out["done"], out["term"], out["f"]
         dw = done.float()
@@ -490,10 +517,11 @@ class TrackingSim:
             dw = (done & ~self.det).float()
         if self.exam is not None:  # exam episodes: outside the statistics (as step_tail)
             dw = (done & ~self.exam).float()
-        self.bin_G.copy_(_bin_ema_w(self.bin_G, self.start_bin, G, dw, 0.8))
+        bw = dw if self.recovery is None else dw * ~self.recovery_episode  # weights of the bin statistics
+        self.bin_G.copy_(_bin_ema_w(self.bin_G, self.start_bin, G, bw, 0.8))
         if self.track_fail:
-            bf = torch.where(dw.sum() > 0, self.bin_fail * 0.999, self.bin_fail)
-            self.bin_fail.copy_(_bin_ema_w(bf, fb, term.float(), dw, 0.9))
+            bf = torch.where(bw.sum() > 0, self.bin_fail * 0.999, self.bin_fail)
+            self.bin_fail.copy_(_bin_ema_w(bf, fb, term.float(), bw, 0.9))
         out["n_done"] = dw.sum()
         out["ep_len_sum"] = (T * dw).sum()
         out["ep_ret_norm_sum"] = (self.ep_ret / (T * MAX_STEP_REWARD) * dw).sum()
@@ -559,7 +587,9 @@ class TrackingSim:
 
     def step_core(self, a: torch.Tensor) -> dict:
         """The step up to the episode ends: no host synchronization (pushes aside), so it can be captured in a CUDA
-        graph (train.py --collect_graph). The simulator wrapper rebinds f, ep_step and a_prev."""
+        graph (train.py --collect_graph). The simulator wrapper rebinds f, ep_step and a_prev. With recovery, the
+        reward and the termination follow recovery.advance, out also holds the regime of the state s and this
+        control's switch and stop (recovery_switch, recovery_stop), and the regime is updated in place."""
         if self.pipe.stateful and self._obs is None:
             self.observe()
         o, o_state = self._obs, self._obs_state
@@ -581,8 +611,15 @@ class TrackingSim:
                                                           PHYSICS_DT, noise=self.randomize)  # fmt: skip
         S1 = self.state()
         f1 = f + 1
-        r, terms = self.mdp.reward(S1, f1, a, a_prev, terms=True)
-        term = self.mdp.termination(S1, f1)
+        if self.recovery is None:
+            r, terms = self.mdp.reward(S1, f1, a, a_prev, terms=True)
+            term = self.mdp.termination(S1, f1)
+        else:
+            start = {k: v.clone() for k, v in self.regime.items()}
+            regime, row, scale, stop, switch = recovery_rules.advance(self.mdp, self.recovery, S1, f1, start)
+            r, terms = self.mdp.reward(S1, row, a, a_prev, terms=True,
+                                       recovery=(scale, start["recovering"], regime["command_offset"]))
+            term = recovery_rules.termination(start["recovering"], stop, self.mdp.termination(S1, f1))
         clip_end = self.motion.clip_end[self.motion.clip_id[f]]
         timeout = (f1 >= clip_end) | (ep_step + 1 >= self.max_episode_steps)
         done = term | timeout
@@ -594,6 +631,10 @@ class TrackingSim:
             out["o"], out["obs_state"] = o, self.pipe.pack(o_state)
         if self.push_enabled:
             out["cut"] = done | self._push(done)
+        if self.recovery is not None:
+            out.update(start, recovery_switch=switch, recovery_stop=stop)
+            for k, v in regime.items():
+                self.regime[k].copy_(v)
         # bookkeeping
         self.ep_disc_ret += (self.gamma ** ep_step.float()) * r
         self.ep_ret += r
