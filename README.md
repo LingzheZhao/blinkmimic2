@@ -364,6 +364,9 @@ and (c) 2026 ETH Zurich, Chong Zhang. Data-derived files are excluded; see above
   of the reset noise ([`env.placed_state`](src/blinkmimic2/env.py)); without them it draws as before.
 - [`tools/rollouts.py`](tools/rollouts.py) rolls a checkpoint's policy out from placed starts and records every
   control: [ROLLOUTS.md](ROLLOUTS.md).
+- [`tools/mujoco_rollouts.py`](tools/mujoco_rollouts.py) runs the same rollouts with the physics stepped by MuJoCo C
+  on the training simulator's model, with a check mode that compares the two engines from the same states:
+  [ROLLOUTS.md](ROLLOUTS.md#rollouts-on-mujoco-c).
 - `train.py --recovery_*` trains recovery from placed lying starts against a hidden get-up reference, in the
   simulator and in imagination (`PRESET[recovery]`, with its control condition `PRESET[recovery_control]`):
   [RECOVERY.md](RECOVERY.md).
