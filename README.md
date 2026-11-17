@@ -364,4 +364,7 @@ and (c) 2026 ETH Zurich, Chong Zhang. Data-derived files are excluded; see above
   of the reset noise ([`env.placed_state`](src/blinkmimic2/env.py)); without them it draws as before.
 - [`tools/rollouts.py`](tools/rollouts.py) rolls a checkpoint's policy out from placed starts and records every
   control: [ROLLOUTS.md](ROLLOUTS.md).
+- `train.py --recovery_*` trains recovery from placed lying starts against a hidden get-up reference, in the
+  simulator and in imagination (`PRESET[recovery]`, with its control condition `PRESET[recovery_control]`):
+  [RECOVERY.md](RECOVERY.md).
 - [`tests/`](tests): unit tests that run on the CPU, `python -m unittest discover -s tests`.

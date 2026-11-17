@@ -60,7 +60,7 @@ def stand_in_sim(N: int, noise: bool, dr: DomainRandCfg = DomainRandCfg()):
     z = lambda *s, dtype=torch.float32: torch.zeros(*s, dtype=dtype)  # noqa: E731
     return SimpleNamespace(
         motion=MOTION, mdp=MDP_, spec=dataclasses.replace(ROBOT, dr=dr), reset_noise=noise, eval_mode=not noise,
-        aprev_ref=False, sim=SimpleNamespace(reset=lambda ids: None),
+        aprev_ref=False, recovery=None, sim=SimpleNamespace(reset=lambda ids: None),
         scene=SimpleNamespace(reset=lambda ids: None, env_origins=z(N, 3)), robot=Recorder(),
         randomizer=SimpleNamespace(reset=lambda xi, ids: None), xi=None, f=z(N, dtype=torch.long),
         ep_step=z(N, dtype=torch.long), a_prev=z(N, ROBOT.num_joints), start_bin=z(N, dtype=torch.long),

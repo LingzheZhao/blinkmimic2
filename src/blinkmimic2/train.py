@@ -114,6 +114,24 @@ parser.add_argument("--wstream_frac", type=float, default=0.25,
 parser.add_argument("--wstream_worlds", type=int, default=8192)
 parser.add_argument("--wstream_steps", type=int, default=2, help="stream steps per iteration")
 parser.add_argument("--wstream_burn", type=int, default=300, help="stream advances when it starts")
+# ---- recovery training (RECOVERY.md): all of these options or none (absent from args.json without them) ----
+parser.add_argument("--recovery_share", type=float, default=argparse.SUPPRESS,
+                    help="share of the resets that are recovery starts")
+parser.add_argument("--recovery_hidden_clips", type=str, nargs="+", default=argparse.SUPPRESS,
+                    help="get-up clips that give the start rows and the hidden reference")
+parser.add_argument("--recovery_command_excluded_clips", type=str, nargs="+", default=argparse.SUPPRESS,
+                    help="clips that never give a command row (every hidden clip among them)")
+parser.add_argument("--recovery_low_pelvis", type=float, nargs=2, default=argparse.SUPPRESS, metavar=("HEIGHT", "UPZ"),
+                    help="a row is low where its pelvis is below HEIGHT m or the world z of its pelvis up axis below UPZ")
+parser.add_argument("--recovery_rows", type=int, nargs=3, default=argparse.SUPPRESS,
+                    metavar=("UPRIGHT_RUN", "LONGEST_SPAN", "COMMAND_UPRIGHT"),
+                    help="upright rows that end a get-up; most rows from a start row to its get-up end; upright rows "
+                         "ahead of a command row")
+parser.add_argument("--recovery_reward_scale", type=float, default=argparse.SUPPRESS,
+                    help="factor on the six tracking terms while recovering")
+parser.add_argument("--recovery_seconds", type=float, nargs=2, default=argparse.SUPPRESS, metavar=("STOP", "BLEND"),
+                    help="consecutive seconds of target error that stop a recovery episode; seconds of the blend back to "
+                         "the command")
 args = parser.parse_args()
 if args.motion_dir and args.bones_list:
     parser.error("--motion_dir is read only with an empty --bones_list (--bones_list=)")
@@ -136,6 +154,21 @@ from blinkmimic2.objective import actor_objective
 from blinkmimic2.mdp import flatten_state
 from blinkmimic2.robot import get_robot
 from blinkmimic2.sensing import ObsPipeline
+from blinkmimic2 import recovery
+
+try:
+    REC_SETTINGS = recovery.settings_from_args(args)
+except ValueError as e:
+    parser.error(str(e))
+if REC_SETTINGS is not None:  # options that read the command row as if the body followed it (RECOVERY.md)
+    _refused = {"--exam_frac != 0": args.exam_frac != 0, "--front_share != 0": args.front_share != 0,
+                "--fail_penalty != 0": args.fail_penalty != 0, "--wstream_frac != 0": args.wstream_frac != 0,
+                "--start_prac_frac >= 0": args.start_prac_frac >= 0,
+                "a non-empty --phase": any(e.strip() for e in args.phase.split(";")), "--pi_ref_skip": args.pi_ref_skip,
+                "--reset_aprev_ref": args.reset_aprev_ref}
+    if any(_refused.values()):
+        parser.error("the recovery options are refused with " + ", ".join(k for k, on in _refused.items() if on)
+                     + ": each reads the command row as if the body followed it (RECOVERY.md, Host configuration)")
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -150,6 +183,12 @@ J = robot.num_joints
 kin = Kinematics(robot, dev)
 motion = MotionLib.load(robot, kin, dev, args.motion_dir, args.bones_list, args.bones_lib, args.motion_store)
 print(f"motion library: {motion.merge_tail_bins()} clip-end bins merged, {motion.num_bins} bins", flush=True)
+REC = None  # recovery training: the setting and the row tables of the library
+if REC_SETTINGS is not None:
+    REC = recovery.build(motion, REC_SETTINGS)
+    json.dump({"settings": vars(REC_SETTINGS), "control_dt": CONTROL_DT, "counts": REC.counts},
+              open(os.path.join(args.log_dir, "recovery.json"), "w"), indent=2)
+    print(f"recovery rows: {REC.counts}", flush=True)
 layout = XiLayout(robot, dev)
 normalize_xi = layout.normalize
 mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), layout.dim, robot.sensing)
@@ -208,7 +247,14 @@ assert not args.front_share or (N_EX > 0), \
     "--front_share needs --exam_frac"
 critic = Critic(CRITIC_IN).to(dev)
 VMAX = (MAX_STEP_REWARD + max(args.contact_reward, 0.0) * 2 * CONTROL_DT) / (1 - args.gamma)  # bound on the critic value (largest per-step reward over 1 - gamma)
+if REC is not None:  # the tracking part of the step reward is scaled by up to the recovery reward scale
+    VMAX = recovery.value_bound(args.gamma, args.contact_reward, REC.settings.reward_scale)
 VCL = torch.zeros(4, device=dev)  # summed clamped fractions (GAE V, targets, actor bootstrap), count
+if REC is not None:  # recovery log columns, summed on the device by the captured steps, read and zeroed at each log row
+    SIM_COUNTS = torch.zeros(8, dtype=torch.long, device=dev)  # collect: see _collect_core
+    IM_COUNTS = torch.zeros(3, dtype=torch.long, device=dev)  # imagined controls by the regime they start in
+    IM_SURVIVAL = torch.zeros(2, device=dev)  # survival to the horizon summed over recovery starts, their count
+    IM_TRACKING_TOTAL = [0]  # imagined tracking-regime controls since the start of the run
 print(f"critic value bound V_max = {VMAX:.4g}", flush=True)
 GRAPH = True
 assert not pipe.stateful, "CUDA graphs: not with stateful sensing"
@@ -309,6 +355,13 @@ def _reward_term(S, f, a, a_prev):
     return mdp.reward(S, f, a, a_prev, w_contact=args.contact_reward), mdp.soft_termination(S, f, scale=1.0)
 
 
+def _reward_term_recovery(S, f, a, a_prev, row, scale, recovering, offset, stop):
+    """_reward_term with recovery: the reward at the target rows ``row`` with the regime's scale, root term and offset
+    (recovery.advance); a control that starts recovering ends only by its stop flag (no gradient)."""
+    return (mdp.reward(S, row, a, a_prev, w_contact=args.contact_reward, recovery=(scale, recovering, offset)),
+            recovery.termination(recovering, stop, mdp.soft_termination(S, f, scale=1.0)))
+
+
 def _gae_targets(V, rews, dones):
     """GAE(lambda) returns over the imagined transitions; V is (H+1, B), bootstrapped from V[-1]."""
     R = V[-1]
@@ -327,8 +380,8 @@ def _wm_norm_data(S0, S1, a, a_prev, xi):
     return wm.inputs(S0, a, a_prev, normalize_xi(xi)), wm.targets(S0, S1), WorldModel.increments(S0, S1)
 
 
-def _critic_input(S, f, xi_n, g):
-    return torch.cat((mdp.critic_features(S, f, xi_n), g), -1)
+def _critic_input(S, f, xi_n, g, root_offset=None):
+    return torch.cat((mdp.critic_features(S, f, xi_n, root_offset), g), -1)
 
 
 wm_rollout = torch.compile(_wm_rollout)
@@ -337,6 +390,7 @@ imag_step = torch.compile(_imag_step)
 imag_step_z = torch.compile(_imag_step_z)
 imag_step_sensed = torch.compile(_imag_step_sensed)
 reward_term = torch.compile(_reward_term)
+reward_term_recovery = torch.compile(_reward_term_recovery)
 critic_input_c = torch.compile(_critic_input)
 wm_norm_data_c = torch.compile(_wm_norm_data)
 gae_targets_c = torch.compile(_gae_targets)
@@ -491,6 +545,8 @@ def policy_update():
     g = g0
     S0 = S
     Ss, As, Aps, Fs, Gs = [], [], [], [], []
+    if REC is not None:  # recovery: the regime of each imagined state, from the regime stored with the start
+        Regs, Rows, Scales, Stops = [{k: s[k] for k in recovery.KEYS}], [], [], []
     if BGE and not pipe.stateful:
         # the goals of an imagined rollout depend only on the reference frames f, f+1, ..., f+H, so they and the motion
         # latents are computed once for the whole horizon: one large GEMM chain instead of H small ones (same gradient)
@@ -508,10 +564,19 @@ def policy_update():
         else:
             S, a_prev, o_hist, f, g = imag_step(S, o_hist, a_prev, f, xi, xi_n, g)
         Ss.append(S), As.append(a_prev), Fs.append(f), Gs.append(g)
+        if REC is not None:
+            with torch.no_grad():
+                reg, row, scale, stop, _ = recovery.advance(mdp, REC, S, f, Regs[-1])
+            Regs.append(reg), Rows.append(row), Scales.append(scale), Stops.append(stop)
     flat = lambda xs: torch.stack(xs).flatten(0, 1)  # noqa: E731  (H*B, ...)
     S_all = tuple(flat([St[i] for St in Ss]) for i in range(6))
     f_all = flat(Fs)
-    r, d = reward_term(S_all, f_all, flat(As), flat(Aps))
+    if REC is None:
+        r, d = reward_term(S_all, f_all, flat(As), flat(Aps))
+    else:  # each control's regime is that of the state it starts from; the offset is the reached state's
+        r, d = reward_term_recovery(S_all, f_all, flat(As), flat(Aps), flat(Rows), flat(Scales),
+                                    flat([R["recovering"] for R in Regs[:-1]]),
+                                    flat([R["command_offset"] for R in Regs[1:]]), flat(Stops))
     r, d = r.view(HZ, B), d.view(HZ, B)
     r_log = r  # the tracking reward alone (log column imag_r)
     if args.fail_penalty > 0:
@@ -526,7 +591,13 @@ def policy_update():
             f_c = torch.cat((s["f"].unsqueeze(0), torch.stack(Fs)), 0).flatten()
             g_c = torch.cat((g0.unsqueeze(0), torch.stack(Gs)), 0).flatten(0, 1)
             xi_c = xi_n.unsqueeze(0).expand(HZ + 1, -1, -1).flatten(0, 1)
-            X = critic_input_c(S_c, f_c, xi_c, g_c).view(HZ + 1, B, -1)
+            off_c = None
+            if REC is not None:  # a recovering state's value reads its hidden row and that row's goal
+                f_c = torch.where(torch.stack([R["recovering"] for R in Regs]).flatten(),
+                                  torch.stack([R["hidden_frame"] for R in Regs]).flatten(), f_c)
+                g_c = motion.goal(f_c, K)
+                off_c = torch.stack([R["command_offset"] for R in Regs]).flatten(0, 1)
+            X = critic_input_c(S_c, f_c, xi_c, g_c, off_c).view(HZ + 1, B, -1)
         critic.norm.update(X)
         with torch.no_grad():
             Vx = critic(X)
@@ -550,12 +621,23 @@ def policy_update():
                 opt_v.step()
         return v_loss
 
-    v_boot = critic(critic_input_c(S, f, xi_n, g))
+    if REC is None:
+        v_boot = critic(critic_input_c(S, f, xi_n, g))
+    else:  # as critic_fit
+        f_v = torch.where(Regs[-1]["recovering"], Regs[-1]["hidden_frame"], f)
+        v_boot = critic(critic_input_c(S, f_v, xi_n, motion.goal(f_v, K), Regs[-1]["command_offset"]))
     if v_boot is not None:
         VCL[2].add_((v_boot.detach() > VMAX).float().mean())
         v_boot = v_boot.clamp(max=VMAX)
     # CUDA graphs: survival products as a loop (cumprod's backward reads the host)
     J, c_t, c = actor_objective(r, d, v_boot, args.gamma, 1.0, loop_cumprod=GR)
+    if REC is not None:
+        with torch.no_grad():
+            reg_t = recovery.regime(torch.stack([R["recovering"] for R in Regs[:-1]]),
+                                    torch.stack([R["blend_left"] for R in Regs[:-1]]))
+            IM_COUNTS.add_((reg_t.unsqueeze(-1) == torch.arange(3, device=dev)).sum((0, 1)))
+            rec0 = s["recovering"].float()
+            IM_SURVIVAL.add_(torch.stack(((c.detach() * rec0).sum(), rec0.sum())))
     r_sum = (c_t * r_log).detach().sum(0)
     loss = -(J).mean()
     opt_pi.zero_grad(set_to_none=True)
@@ -595,7 +677,8 @@ def policy_update():
 sim_cfg = make_sim(robot)
 mdp.reward, mdp.termination, mdp.obs = torch.compile(mdp.reward), torch.compile(mdp.termination), torch.compile(mdp.obs)
 motion.goal = torch.compile(motion.goal)
-env = TrackingSim(sim_cfg, args.num_envs, robot, motion, mdp, dev, gamma=args.gamma, fail_reset=args.fail_reset, bin_fix=True)
+env = TrackingSim(sim_cfg, args.num_envs, robot, motion, mdp, dev, gamma=args.gamma, fail_reset=args.fail_reset, bin_fix=True,
+                  recovery=REC)
 env.aprev_ref = args.reset_aprev_ref
 if PHASE:
     env.aprev_gate = torch.ones((), dtype=torch.bool, device=dev)
@@ -809,7 +892,8 @@ if N_EX:
           + (f", bank from their failures (window {48}, last {args.exam_every} its, rebuilt every "
              f"{50} its, share {0.0})" if False else ""), flush=True)  # fmt: skip
 buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev, J, layout.dim,
-                      mdp.obs_dim if pipe.stateful else None, pipe.state_dim if pipe.stateful else None, danger=False)  # fmt: skip
+                      mdp.obs_dim if pipe.stateful else None, pipe.state_dim if pipe.stateful else None, danger=False,
+                      recovery=REC is not None)  # fmt: skip
 obs_hist = torch.zeros(args.num_envs, Hh, mdp.obs_dim, device=dev)
 if args.start_prac_frac >= 0:
     assert 0 < N_EX < args.num_envs, "--start_prac_frac needs --exam_frac in (0, 1)"
@@ -916,6 +1000,15 @@ def _collect_core():
         exam_record(out)
     buffer.add_device(out)
     S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
+    if REC is not None:
+        # SIM_COUNTS: first controls of episodes; of them, recovery starts; of those, starts whose pelvis x axis is within
+        # 0.1 of vertical (the heading of rotations.yaw_mat is ill-defined there); collected rows by the regime of s
+        # (tracking, recovery, blend); switches; stops
+        first, rec0 = out["ep_step"] == 0, out["recovering"]
+        low_heading = torch.hypot(S0[1][:, 0, 0], S0[1][:, 1, 0]) < 0.1
+        by_regime = (recovery.regime(rec0, out["blend_left"]).unsqueeze(-1) == torch.arange(3, device=dev)).sum(0)
+        SIM_COUNTS.add_(torch.cat((torch.stack((first.sum(), (first & rec0).sum(), (first & rec0 & low_heading).sum())),
+                                   by_regime, torch.stack((out["recovery_switch"].sum(), out["recovery_stop"].sum())))))
     wm_in, wm_out, wm_inc = (wm_norm_data_c)(S0, S1, out["a"], out["a_prev"], out["xi"])
     wm.in_norm.update(wm_in)
     wm.out_norm.update(wm_out)
@@ -1171,6 +1264,12 @@ new_log = not os.path.exists(log_path) or os.path.getsize(log_path) == 0
 log_f = open(log_path, "a")
 anchor_cols = ""
 anchor_cols += ""
+if REC is not None:  # RECOVERY.md, Records
+    anchor_cols += (",recovery_start_share,recovery_start_low_heading_share,recovery_collected_share_tracking,"
+                    "recovery_collected_share_recovery,recovery_collected_share_blend,recovery_switches,recovery_stops,"
+                    "recovery_imagined_share_tracking,recovery_imagined_share_recovery,recovery_imagined_share_blend,"
+                    "recovery_imagined_tracking_total,recovery_imagined_survival_recovery_starts,"
+                    "recovery_clamped_share_values,recovery_clamped_share_targets,recovery_clamped_share_bootstrap")
 log_f.write("iteration,wall_h,sim_steps,wm_loss,wm_err8,pi_loss,v_loss,imag_rew,pi_gradnorm,imag_survival,sim_rew,ep_len,ep_ret_norm,term_frac,it_per_s,lr"
             + anchor_cols + ",pi_lr,pi_mult,nonfinite\n")  # fmt: skip
 log_f.flush()
@@ -1251,6 +1350,14 @@ for it in range(start_it, args.iterations):
         term_frac = float(sum(float(v) for v in stats["term"]) / max(sum(float(v) for v in stats["done"]), 1))
         row = [it + 1, wall_h, sim_steps, mean(agg["wm"]), mean(agg["wm8"]), mean(agg["pi"]), mean(agg["v"]), mean(agg["ir"]),
                mean(agg["gn"]), mean(agg["surv"]), mean(stats["r"]), mean_nn(stats["ep_len"]), mean_nn(stats["ep_ret"]), term_frac, ips, lr]  # fmt: skip
+        if REC is not None:  # the columns of anchor_cols
+            sc, ic, sv, vr = SIM_COUNTS.tolist(), IM_COUNTS.tolist(), IM_SURVIVAL.tolist(), VCL.tolist()
+            SIM_COUNTS.zero_(), IM_COUNTS.zero_(), IM_SURVIVAL.zero_()
+            IM_TRACKING_TOTAL[0] += ic[0]
+            share = lambda x, n: x / n if n else float("nan")  # noqa: E731
+            row += ([share(sc[1], sc[0]), share(sc[2], sc[1])] + [share(x, sum(sc[3:6])) for x in sc[3:6]] + sc[6:8]
+                    + [share(x, sum(ic)) for x in ic] + [IM_TRACKING_TOTAL[0], share(sv[0], sv[1])]
+                    + [share(x, vr[3]) for x in vr[:3]])
         extra = [lr * pi_mult, float(pi_mult), int(NONFINITE)] if LOG_EXTRA else []
         log_f.write(",".join(f"{x:.6g}" if isinstance(x, float) else str(x) for x in row + extra) + "\n")
         log_f.flush()
