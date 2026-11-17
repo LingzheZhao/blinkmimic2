@@ -173,10 +173,45 @@ and read after it, so the flags cover the control's four substeps: `rows_beyond_
 the world concerned, and `contacts_beyond_capacity` its BROADPHASE or NARROWPHASE bit, which MuJoCo Warp sets on
 every world of the batch when the pooled contact array overflows.
 
+## Videos of a record
+
+[`tools/render_rollouts.py`](tools/render_rollouts.py) replays the recorded states of a record as videos. It is a
+replay, not a rollout: no physics and no policy run, and a video shows nothing between the recorded controls.
+
+```bash
+MUJOCO_GL=egl python tools/render_rollouts.py rollouts/run_s1_6500 --trials 0 3 --out videos/run_s1_6500
+MUJOCO_GL=egl python tools/render_rollouts.py rollouts/run_s1_6500 rollouts/run_s2_6500 --labels s1 s2 \
+    --trials 0 --out videos/s1_s2
+```
+
+- A frame shows the robot after a control (the placed start first) and, as a translucent blue second robot, the
+  command's reference pose at the row after that control: the command the policy tracks, not a prediction. With
+  `--ghost_at world` (the default) the command pose is at its own world pose; with `--ghost_at robot` its root is
+  moved in the horizontal plane to the robot's root at every frame (height, orientation and joints unchanged), so a
+  placed start's command stays in view, and the text line says so. The camera follows the root; a text line gives the
+  label, trial, clips, control and seconds.
+- The record holds no state after a trial ends, so from its ending control on the video holds the last recorded state
+  (and, under `--ghost_at robot`, the command pose at its position) and says at which control the trial ended.
+- A video ends `--tail` seconds (default 2; negative or `all`: every control) after the earlier of the trial's end and
+  the first control from which `command_row_after` equals `clip_last_row` at every later control the trial runs, at
+  most at the last recorded control; side by side, after the later panel's. The JSON's `stop` gives the control, its
+  reason (`trial ended`, `clip ended`, or `all controls` with no end point or a tail past the record) and the last
+  frame's control: with `--stride`, the first at or after the stop, or the last frame within the record when that
+  comes first (it can then come before the stop).
+- Two record folders are shown side by side on one time axis, as two runs from one start, only if they hold the same
+  trials (scene, trial count, body and command rows, start states within 1e-5).
+- The model is the simulator's (mjlab's scene of `make_scene_cfg`, built on the CPU); the motion library is the
+  record's, and a library with other rows is refused.
+- Per trial: `trial_NNN.mp4` (H.264), `trial_NNN.png` (8 frames) and `trial_NNN.json` (sources, trial, frame count,
+  stride, stop, options). `--fps` defaults to the control rate, so a `--stride` above 1 plays faster than trial time.
+- Requirements: mujoco with an OpenGL backend chosen by `MUJOCO_GL` (`egl` by default; without one the tool refuses),
+  mjlab, torch, numpy, Pillow, and ffmpeg with libx264 (on `PATH`, else imageio-ffmpeg's).
+
 ## Tests
 
-`python -m unittest discover -s tests` runs on the CPU, without a simulator or GPU, with a library of generated clips
-(`tests/synthetic.py`), the release's kinematics and MDP, and a stand-in for the simulator. The tests cover:
+`python -m unittest discover -s tests` runs on the CPU, without a simulator or GPU (one small render uses an OpenGL
+backend where one is present), with a library of generated clips (`tests/synthetic.py`), the release's kinematics and
+MDP, and a stand-in for the simulator. The tests cover:
 
 - the placement (`env.placed_state`): the random reset noise drawn in the release's order with the release's values,
   for a few reset worlds and for every world as `reset_masked` draws it; no draw without noise; the uniforms times
@@ -193,7 +228,13 @@ every world of the batch when the pooled contact array overflows.
   root velocity, from its control on, and is not applied after the trial's end;
 - the command line's refusals of an existing output directory and of zero controls;
 - `train.py --motion_dir`: refused with a non-empty `--bones_list`; the library `tools/evaluate.py` builds from such
-  a run's `args.json` is the folder's clips; a folder without motion files is refused.
+  a run's `args.json` is the folder's clips; a folder without motion files is refused;
+- `tools/render_rollouts.py`, on records `roll_out` writes from a stand-in: MuJoCo's kinematics of a replayed state and
+  of a command row give the record's bodies and command bodies; the command pose at its world pose or at the robot's
+  root xy; the frames of a stride and of ended trials; the clip end found in the record and the control a video stops
+  at, for one record and side by side; the choice and order of trials; the refusals of a record that lacks a field,
+  of two records of other trials, of another library and of a missing OpenGL backend; and, with `MUJOCO_GL=egl` when
+  the backend is present, a small render (otherwise the tool's refusal).
 
 They leave out what needs the simulator and a GPU: `rollouts.Simulator` (the placement through `TrackingSim.reset`,
 pushes written to the simulator, the command row held through `TrackingSim.step`, and the reading of MuJoCo Warp's
