@@ -199,3 +199,141 @@ They leave out what needs the simulator and a GPU: `rollouts.Simulator` (the pla
 pushes written to the simulator, the command row held through `TrackingSim.step`, and the reading of MuJoCo Warp's
 counts and overflow bits), `main` (loading the run, the checkpoint and the library, the rounding of the products
 under TF32, and the files written) and `train.py` passing `--motion_dir` to the library (it trains once parsed).
+
+## Rollouts on MuJoCo C
+
+[`tools/mujoco_rollouts.py`](tools/mujoco_rollouts.py) runs the same rollouts with the physics stepped by MuJoCo C
+(the `mujoco` package) in place of MuJoCo Warp, and writes the same record.
+
+```bash
+python tools/mujoco_rollouts.py --run_dir logs/run_s1 --ckpt 6500 --scene scene.json --termination nonfinite \
+    --controls 1000 --threads 16 --out rollouts/run_s1_6500_mujoco
+```
+
+The options are those of `tools/rollouts.py` plus `--threads`, the number of threads that step the trials (required,
+at least 1), and `--checks RECORD` (below).
+
+**What is the same.** The program loads the run, the checkpoint, the library and the scene as `tools/rollouts.py`
+does, runs the policy on `cuda:0` at the same precision (bf16 autocast for `--amp bf16`, TF32, elementwise rotation
+products), builds the evaluation-mode `TrackingSim` as that tool builds it, and runs its loop `rollouts.roll_out`:
+the history, the goal, the command, the terminations, the re-placement of ended trials and the record. The simulator
+object (`MujocoC`) replaces only `rollouts.Simulator`. It computes the placement (`TrackingSim.reset` in evaluation
+mode, the joint clamp included), the state tuple (`TrackingSim.state`), the observation (no noise, no delay), the push
+and the actuator target (default pose plus the joint offsets of `xi` plus the action scale times the action) with the
+same float32 torch expressions on the same device, and holds its own previous action (zero at a placement, the
+action after a control) and its own `xi` (that of the evaluation: friction 1, the rest 0). A run whose simulator has
+randomization, reset noise, stateful sensing, the recovery options, delayed actuators or actuators other than mjlab's
+built-in joint position actuators is refused.
+
+**The model.** MuJoCo C steps the `MjModel` the training simulator is built from (`TrackingSim.sim.mj_model`,
+compiled by mjlab with `make_sim`'s options applied) and nothing else, with the entries mjlab wrote into MuJoCo
+Warp's per-world model after compilation. In evaluation mode these are the sliding frictions of 1 that
+`DomainRandomizer.startup` writes to the robot's geoms (the feet's compiled 0.6 among them); the floor keeps its
+compiled 1. A field whose worlds differ raises. The options are those of MuJoCo Warp's model, which are the compiled
+model's except the solver tolerance: MuJoCo Warp's `put_model` raises it to at least 1e-6 for float32, so for a
+robot whose `solver` sets less (`mjlab_g1`: 1e-8) MuJoCo C is given MuJoCo Warp's value, recorded under
+`simulator.options_written`; any other option in which the two models differ raises (the check mode lists it
+instead). Every other field is the compiled model's: the geoms' contact flags (`contype`, `conaffinity`, `condim`,
+`priority`, margins), the excluded body pairs, friction, the solver (Newton, `iterations`, `ls_iterations` and
+`ccd_iterations` of the robot's `solver`), the `implicitfast` integrator, the pyramidal cone, the 5 ms time step with
+four substeps per control, gravity, and the actuators (fixed gain kp, bias -kp q - kd qdot, force range, ctrl not
+limited). The qpos, qvel and ctrl addresses are found by joint name and must equal mjlab's indexing and its path from the position target to `ctrl`, which writes the target
+of each joint, unclamped, to that joint's actuator; a mismatch raises. The check mode dumps the model and sets it
+beside MuJoCo Warp's model, option by option and field by field.
+
+**What differs.** These set-up differences remain, besides the engine itself (its collision routines, constraint
+solver implementation, Jacobian representation under the `auto` option and arithmetic; MuJoCo Warp, for one, puts a
+floor of 1e-6 under a line search's gradient tolerance, which no option reaches):
+
+- precision: MuJoCo C holds the model and the state in float64, MuJoCo Warp in float32. Each trial has one `MjData`
+  for the whole rollout; between controls nothing is written to it from the float32 state, and the solver's warm
+  start (`qacc_warmstart`) is carried from step to step as MuJoCo C carries it and cleared by `mj_resetData` at a
+  placement, as mjlab's reset clears it. Float32 values enter the `MjData` at a placement (exact in float64), as
+  `ctrl`, and as a push's velocity change, which is added in float64 where MuJoCo Warp adds in float32. The policy
+  reads the state rounded to float32.
+- capacities: MuJoCo C has no fixed per-world contact or constraint-row capacity; it allocates both from the
+  `MjData` arena (`narena` bytes, in the description). `contacts` and `constraint_rows` are MuJoCo C's `ncon` and
+  `nefc` after the control's last substep. `contacts_beyond_capacity` and `rows_beyond_capacity` are set where the
+  `CONTACTFULL` or `CNSTRFULL` warning count of the trial's data rose during the control, that is, where the arena ran
+  full and contacts or constraint rows were dropped. The description's `nconmax`, `njmax` and `naconmax_pooled` are
+  null.
+- bad states: in a step that meets a position, velocity or acceleration that is not finite or beyond 1e10, MuJoCo C
+  warns and resets the data to the model's initial state, which would otherwise continue the trial from that state.
+  The state after a control in which one of these warnings or the warning of a bad `ctrl` rose, or in which the
+  data's time went back, is recorded as not finite, so the trial ends as a non-finite state ends it on MuJoCo Warp.
+- stepping: the trials are split into contiguous chunks over `--threads` threads (`mj_step` releases Python's
+  interpreter lock), each thread stepping its own trials' `MjData`; the policy runs batched on the card. The record
+  does not depend on the number of threads.
+
+**Record.** `rollouts.npz` has the fields, shapes, types and meanings of the record above. `description.json` has the
+keys and values of `tools/rollouts.py`'s, except `simulator`, which names the engine (`"engine": "MuJoCo C"`, the
+`mujoco` version, the threads, the entries written after compilation, the options taken from MuJoCo Warp's model,
+the state's precision, the null MuJoCo Warp capacities, `narena`, the robot's solver setting as `tools/rollouts.py`
+records it, the physics time step, the substeps and the options MuJoCo C steps with), and `settings.versions`, which
+adds `mujoco`. `card` is the device of the policy, not of the physics.
+
+### Check mode
+
+`--checks RECORD`, with RECORD a `tools/rollouts.py` output on the same scene file and library, writes `checks.json`
+in place of the rollouts. It is meant to be read before any MuJoCo C rollout is. It holds the description and:
+
+- (a) placement: every trial placed on MuJoCo C, with its state and tracked bodies (the release's kinematics) against
+  the record's `start_state`, `start_body_pos_w` and `start_body_quat_w`, the largest difference per field; the
+  training simulator's placement in the same process against the record; `qpos` and `qvel` of the two engines
+  after placement; MuJoCo C's own body positions and orientations (`mj_kinematics`) against the record's.
+- (b) one control from the same placed state with the same action (the policy's first action, one tensor for both):
+  on the trials lifted 2 m, where at most self-contacts and joint limits act, which tests the actuators, gains,
+  integrator and gravity; and on the scene's placed trials with their floor contact. The contacts and constraint rows
+  of both engines are given (MuJoCo C's also as the largest over the control's substeps, with its joint-limit rows;
+  the training simulator's after the last substep only), and two subsets are reported apart: the trials without
+  contact (none in any substep on MuJoCo C, none after the last substep on the training simulator) and the trials
+  without constraint rows (the same, for rows), where no constraint acts. Beside each are the difference between two steps of the training
+  simulator from that same state (its own repeatability), that between two steps of MuJoCo C, and the state's change
+  over the control on the training simulator (the scale of the differences). The `ctrl` of the two engines after the
+  control must be equal.
+- (c) the model: MuJoCo C's options, per-geom contact settings, explicit and excluded pairs, actuators and dofs; the
+  fields and options where it differs from the training simulator's `MjModel` (only the entries and options written,
+  as it is a copy of that model); the entries and options written. The models the two engines step are compared in
+  two further entries, which are where a difference between them appears: each option the two hold, MuJoCo C's value
+  beside MuJoCo Warp's, equal at the float32 rounding of MuJoCo C's value or not (`impratio` through MuJoCo Warp's
+  `impratio_invsqrt`), with the options only one of them holds named; and every array field of MuJoCo Warp's model
+  against MuJoCo C's field of that name, the entries that differ in any world, with the fields of another layout and
+  those the `MjModel` does not hold named. Last, the largest difference between mjlab's default pose and the robot's.
+- (d) two rollouts of the first 50 controls (fewer when `--controls` is smaller) of the scene's trials on MuJoCo C,
+  compared field by field, with their durations.
+
+Differences are reported with the trial where the largest is, the median over trials and the trials left out as not
+finite; no tolerance is applied. A RECORD of another scene or library, a record whose tracked bodies or rows are not
+the robot's and the scene's, and `ctrl` that differs between the engines (a joint-to-actuator mismatch) raise.
+
+### Comparing the two engines' records
+
+The two records have the same fields, so one reader reads both, and a difference between them is one of engine, not
+of model, scene, policy or loop (apart from what the check mode lists). Trials are not repeatable on MuJoCo Warp
+(Repeatability, above), so a MuJoCo C trial and the MuJoCo Warp trial from the same start are two runs from one start,
+not one trial computed twice: compare counts and averages over trials, and set the trials that change outcome between
+the engines beside those that change among repeated MuJoCo Warp rollouts of the same checkpoint. A comparison does
+not separate MuJoCo C's float64 arithmetic from its algorithms, and it says nothing about a physical robot.
+
+Nothing in a record names its engine but `simulator` (and the `mujoco` entry of `settings.versions`). A reader that
+checks the scene, termination, controls, library, control period, robot and the run's identity of the records it
+reads together, and not `simulator`, accepts a MuJoCo C record, and also a set of records that mixes the two engines
+for one checkpoint. Records read together are to be taken from one engine by their directories, and a reading that
+lists its records' directories and `card` names its engine only through those directories (`card` is the policy's
+device on both engines).
+
+### Tests of the MuJoCo C rollouts
+
+`tests/test_mujoco_rollouts.py` runs on the CPU with the robot's model as mjlab compiles it (the scene of
+`make_scene_cfg` with `make_sim`'s options, built on the CPU), small generated models and the synthetic library. It
+covers the addresses by joint name and their refusals; the model from the training simulator's per-world fields and
+its refusals; the options taken from MuJoCo Warp's model (the tolerance raised as `put_model` raises it), the option
+comparison and their refusals; the comparison of model fields; the placement against `env.placed_state`; a trial
+placed again after controls and a bad state, which holds what a trial placed once holds and steps as it does; the
+previous action and `xi` owned by the object, and `ctrl` read through each actuator's joint; one state chain (after several controls the object's data equal, bitwise, a plain
+`mj_step` loop from the placed data); the report; pushes and lifts; the record's fields, shapes and types against the
+CPU stand-in's through the same `roll_out`; the same record with one and with three threads; a bad state ending a
+trial as not finite; the checks with a second MuJoCo C object as the training simulator, and their refusals; the
+reports; the description's keys against `tools/rollouts.py`'s; and the command line's refusals. They leave out what
+needs MuJoCo Warp and a GPU: `MujocoC.from_training` and the model taken from a built `TrackingSim`, the training
+simulator's side of the checks, `main`, and the arena-full flags, which these models do not reach.
