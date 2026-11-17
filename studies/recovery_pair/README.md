@@ -137,8 +137,18 @@ during training (RECOVERY.md, "Not implemented"), and a training that ends early
   `recovery.json`. The joints of a placed start are clamped to the joint ranges of the model. No pelvis yaw at
   placement is recorded.
 - **Twins.** Trials are not repeatable one by one here, so a twin is a reference, not a copy.
-- **Anchor.** This trainer's reward and termination anchor is the pelvis; E's alignment keeps the reading's anchor,
-  `torso_link`.
+- **Termination penalty.** NablaMimic's recipe trains control and recovery with a termination penalty
+  (`--term-penalty 2 0.08 0.10` in NablaMimic's `configs/base/ours.args`, which `configs/absolute.args` and
+  `configs/recovery.args` include: weight 2, growing quadratically once the pelvis-height difference exceeds 0.08 m or
+  the up-axis difference exceeds 0.10; at the hidden row during recovery). Here `PRESET[baseline]` sets
+  `--fail_penalty 0`, which switches off the release recipe's failure penalty (default 3.0, on the soft termination
+  probability at every imagined step), and recovery mode refuses another value, because that penalty reads the command
+  row and a penalty at the hidden target row is not implemented (RECOVERY.md, "Host configuration" and "Differences
+  from the NablaMimic setting"). It is an untested candidate for the ends on get-up clips (Results). A test needs that
+  penalty implemented and a control and a recovery training at both seeds, read as ends per reference get-up over
+  repeated rollouts.
+- **Anchor.** This trainer's reward anchor is the pelvis, NablaMimic's the torso link; both trainers' terminations read
+  the pelvis. E's alignment keeps the reading's anchor, `torso_link`.
 - **Records.** Completion is read from the last checkpoint and the last log row, not from a terminal record; there is
   no wall-time limit to declare; the identity of a seed's two trainings is read from `args.json`, which holds neither
   the card nor the source revision.
@@ -238,7 +248,8 @@ reading test gives the entry a stand-in for `readings_core.py`, so it needs no N
 
 - **Small differences.** It cannot carry small differences, or any statement beyond its two seeds.
 - **A validation.** It is not a validation of getting up. The placed starts are drawn from the recovery training's own
-  start rows, and the five hidden get-up clips are tracking commands in both conditions.
+  start rows, and the five hidden get-up clips are training data in both conditions: commands of the control and the
+  hidden reference of the recovery training.
 - **Other interference.** It cannot separate interference beyond the lower tracking exposure of recovery training and
   the iterations that tracking and recovery share.
 - **Pushes, contact and speed.** It covers no pushes or falls during execution, and no contact, since the readings are
@@ -260,7 +271,8 @@ GeForce RTX 4090 with 48 GB under a 350 W power limit, with empty compile caches
 through mjlab 1.6.0 with 128 contacts per world (pooled) and 500 constraint rows; the largest counts in a rollout of the
 eight saves are 38 contacts and 152 constraint rows, and no trial exceeded the capacity. Control seed 1's saves other
 than 3,500 and 7,000 were rolled out on an NVIDIA RTX 6000 Ada. Every training completed its 7,000 iterations. No
-training, rollout or reading failed or was skipped.
+training, rollout or reading failed or was skipped. Three further sets of three rollouts (placed starts, twins, first
+rows) of two saves, 18 rollouts in all (below), ran at the same revision on an RTX 4090 with 48 GB; none failed.
 
 | Save | Get up of 100 (R) | Rejoin of 100 (J) | Rejoined over got up (readable) | Twins that fall (F) | Clips completed of 40 (C) | Body-position error E (m) |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -273,29 +285,25 @@ training, rollout or reading failed or was skipped.
 | recovery, seed 1, 3,500 | 99 | 99 | 99 / 99 | 0 | 38 | 0.0428 |
 | recovery, seed 1, 7,000 | 97 | 97 | 97 / 97 | 0 | 39 | 0.0387 |
 
-The fall rule at placement reads the state after the first control. Placed start 99 is outside it at every save;
-placed start 25 sits at the 60° tilt threshold there and is outside it at six of these saves (not recovery seed 0 at
-7,000 and seed 1 at 3,500), so 98 or 99 starts are inside the rule; a start outside counts as not got up. At recovery
-seed 0, 7,000 one rejoin is unavailable because its twin fell. The control saves complete all five hidden get-up clips;
-the recovery saves miss fallAndGetUp1_subject1 (seed 0, 3,500), fallAndGetUp2_subject2 and fallAndGetUp3_subject1
-(seed 0, 7,000), fallAndGetUp2_subject2 (seed 1, 3,500) and fallAndGetUp2_subject3 (seed 1, 7,000). A separate
-recomputation from the rollout records, with code written from the reading rules' words that is not part of this
-repository, agrees with every reading: R, J, rejoined over got up and F at all 56 saves (every 500 iterations of the
-four trainings), and C, the hidden get-up clips and E at the 32 saves with first-row rollouts. Differences below are
-taken before rounding.
+The fall rule at placement reads the state after the first control. Placed start 99 is outside it at every save; placed
+start 25 sits at the 60° tilt threshold there and is outside it at six of these saves (not recovery seed 0 at 7,000 and
+seed 1 at 3,500), so 98 or 99 starts are inside the rule; a start outside counts as not got up. At recovery seed 0,
+7,000 one rejoin is unavailable because its twin fell. In these rollouts the control saves complete all five hidden
+get-up clips; the recovery saves miss fallAndGetUp1_subject1 (seed 0, 3,500), fallAndGetUp2_subject2 and
+fallAndGetUp3_subject1 (seed 0, 7,000), fallAndGetUp2_subject2 (seed 1, 3,500) and fallAndGetUp2_subject3 (seed 1,
+7,000). A separate recomputation from the rollout records, with code not part of this repository, agrees with R, J,
+rejoined over got up and F at all 56 saves (every 500 iterations of the four trainings), and with C, the hidden get-up
+clips and E at the 32 saves with first-row rollouts. Differences below are taken before rounding.
 
 **Outcome: `some_get_up`** (row 7; rows 1 to 6 do not hold). Both seeds are in class "some". `pair.json` reads this
 row as "some get-up, not established as the hidden target's" and sends forward "the per-start reading of which starts
 rise (scene.json and trials.jsonl), before any change". The class gets_up needs R ≥ 50 and R at least the larger
 control R at 7,000 plus 20; the controls get up from 60 and 91 of 100 without recovery training, so that bound is 111
 of 100 and cannot be reached. Read after the numbers: the declared classes do not fit a control that already gets up,
-and the outcome does not say that recovery training failed. At 7,000 the recovery save against its control reads R 99
-against 60, J 98 against 58, C 36 against 40, E 0.0388 against 0.0296 m and F 1 against 0 (seed 0), and R 97 against
-91, J 97 against 90, C 39 against 39, E 0.0387 against 0.0292 m and F 0 against 1 (seed 1). Row 3, control_within
-(the control's R at 7,000 within 10 of the recovery R at each seed), fails at seed 0 only (60 against 99; 91 against
-97 at seed 1). At 3,500 the recovery saves get up from 95 and 99 and the controls from 93 and 97. The tracking terms
-the outcome computed, recovery at 7,000 against each control save of its seed (margins 0.005 m on E, 2 clips on C; F
-is within at every term):
+and the outcome does not say that recovery training failed. Row 3, control_within (the control's R at 7,000 within 10
+of the recovery R at each seed), fails at seed 0 only (60 against 99; 91 against 97 at seed 1). The tracking terms the
+outcome computed, recovery at 7,000 against each control save of its seed (margins 0.005 m on E, 2 clips on C; F is
+within at every term):
 
 | Seed | Against the control at | E difference (m) | Outside the E margin by (m) | C | C within |
 | --- | --- | --- | --- | --- | --- |
@@ -304,12 +312,13 @@ is within at every term):
 | 1 | 7,000 | +0.0096 | 0.0046 | 39 against 39 | yes |
 | 1 | 3,500 | +0.0055 | 0.0005 | 39 against 37 | yes |
 
-No outcome row that holds reads these terms; the rows that read them need both seeds in gets_up. E reads each clip up
-to its first termination, so where the completed clips differ the clips are read over different spans: at 7,000 the
-recovery save misses fallAndGetUp1_subject4, fallAndGetUp2_subject2, fallAndGetUp3_subject1 and
-fightAndSports1_subject1 against none (seed 0), and fallAndGetUp2_subject3 against run1_subject5 (seed 1); the
-controls at 3,500 miss walk2_subject3 (seed 0) and dance1_subject2, fightAndSports1_subject1 and walk2_subject1
-(seed 1).
+No outcome row that holds reads these terms; the rows that read them need both seeds in gets_up. Each term rests on one
+rollout per save; four first-row rollouts of seed 0 at 7,000 read C 36 to 38 for the recovery save and 39 to 40 for the
+control ("Repeated rollouts of one checkpoint" below). E reads each clip up to its first termination, so where the
+completed clips differ the clips are read over different spans: at 7,000 the recovery save misses
+fallAndGetUp1_subject4, fallAndGetUp2_subject2, fallAndGetUp3_subject1 and fightAndSports1_subject1 against none
+(seed 0), and fallAndGetUp2_subject3 against run1_subject5 (seed 1); the controls at 3,500 miss walk2_subject3
+(seed 0) and dance1_subject2, fightAndSports1_subject1 and walk2_subject1 (seed 1).
 
 **Exposure.** The recovery saves at 7,000 have 321,061,586 (seed 0) and 319,211,717 (seed 1) imagined tracking
 controls, which a control reaches at iterations 4,900 and 4,871; a control has 229,376,000 at 3,500 and 458,752,000 at
@@ -322,39 +331,39 @@ iterations, and the completed clips differ (36 against 38, 39 against 40).
 same scene files. `readings.py` read the controls' 28 saves and the recovery runs' four declared saves. The recovery
 runs' 24 other saves were read from placed starts and twins only, with the same `readings_core.py` called by a program
 that is not part of this repository, so they have no C, no E and no record of contact or constraint capacity. Each
-cell gives R / C / E (m) for a control, R for a recovery run, and the seconds from launch to the checkpoint's file time:
+cell gives R / C / E (m) and the seconds from launch to the checkpoint's file time for a control, and R for a recovery
+run:
 
 | Iterations | control, seed 0 | control, seed 1 | recovery, seed 0 | recovery, seed 1 |
 | --- | --- | --- | --- | --- |
-| 500 | 10 / 13 / 0.1008, 663 s | 9 / 1 / 0.1094, 658 s | 3, 672 s | 2, 670 s |
-| 1,000 | 26 / 26 / 0.0652, 728 s | 27 / 26 / 0.0619, 723 s | 8, 739 s | 5, 737 s |
-| 1,500 | 93 / 33 / 0.0466, 792 s | 98 / 32 / 0.0472, 787 s | 59, 806 s | 56, 804 s |
-| 2,000 | 98 / 36 / 0.0390, 857 s | 92 / 36 / 0.0390, 852 s | 87, 873 s | 82, 871 s |
-| 2,500 | 97 / 37 / 0.0343, 922 s | 95 / 35 / 0.0367, 917 s | 87, 940 s | 95, 938 s |
-| 3,000 | 93 / 39 / 0.0331, 986 s | 93 / 39 / 0.0337, 981 s | 96, 1,008 s | 97, 1,006 s |
-| 3,500 | 93 / 39 / 0.0321, 1,051 s | 97 / 37 / 0.0332, 1,046 s | 95, 1,075 s | 99, 1,073 s |
-| 4,000 | 90 / 40 / 0.0313, 1,115 s | 83 / 38 / 0.0325, 1,111 s | 98, 1,142 s | 98, 1,140 s |
-| 4,500 | 75 / 40 / 0.0306, 1,180 s | 83 / 38 / 0.0321, 1,175 s | 99, 1,209 s | 98, 1,207 s |
-| 5,000 | 58 / 38 / 0.0306, 1,245 s | 96 / 40 / 0.0317, 1,240 s | 98, 1,276 s | 97, 1,274 s |
-| 5,500 | 85 / 40 / 0.0297, 1,309 s | 81 / 40 / 0.0306, 1,305 s | 99, 1,343 s | 99, 1,341 s |
-| 6,000 | 76 / 40 / 0.0299, 1,374 s | 89 / 40 / 0.0300, 1,369 s | 98, 1,410 s | 98, 1,408 s |
-| 6,500 | 62 / 39 / 0.0295, 1,438 s | 87 / 40 / 0.0294, 1,434 s | 98, 1,477 s | 98, 1,475 s |
-| 7,000 | 60 / 40 / 0.0296, 1,505 s | 91 / 39 / 0.0292, 1,500 s | 99, 1,546 s | 97, 1,544 s |
+| 500 | 10 / 13 / 0.1008, 663 s | 9 / 1 / 0.1094, 658 s | 3 | 2 |
+| 1,000 | 26 / 26 / 0.0652, 728 s | 27 / 26 / 0.0619, 723 s | 8 | 5 |
+| 1,500 | 93 / 33 / 0.0466, 792 s | 98 / 32 / 0.0472, 787 s | 59 | 56 |
+| 2,000 | 98 / 36 / 0.0390, 857 s | 92 / 36 / 0.0390, 852 s | 87 | 82 |
+| 2,500 | 97 / 37 / 0.0343, 922 s | 95 / 35 / 0.0367, 917 s | 87 | 95 |
+| 3,000 | 93 / 39 / 0.0331, 986 s | 93 / 39 / 0.0337, 981 s | 96 | 97 |
+| 3,500 | 93 / 39 / 0.0321, 1,051 s | 97 / 37 / 0.0332, 1,046 s | 95 | 99 |
+| 4,000 | 90 / 40 / 0.0313, 1,115 s | 83 / 38 / 0.0325, 1,111 s | 98 | 98 |
+| 4,500 | 75 / 40 / 0.0306, 1,180 s | 83 / 38 / 0.0321, 1,175 s | 99 | 98 |
+| 5,000 | 58 / 38 / 0.0306, 1,245 s | 96 / 40 / 0.0317, 1,240 s | 98 | 97 |
+| 5,500 | 85 / 40 / 0.0297, 1,309 s | 81 / 40 / 0.0306, 1,305 s | 99 | 99 |
+| 6,000 | 76 / 40 / 0.0299, 1,374 s | 89 / 40 / 0.0300, 1,369 s | 98 | 98 |
+| 6,500 | 62 / 39 / 0.0295, 1,438 s | 87 / 40 / 0.0294, 1,434 s | 98 | 98 |
+| 7,000 | 60 / 40 / 0.0296, 1,505 s | 91 / 39 / 0.0292, 1,500 s | 99 | 97 |
 
 The controls get up from 92 to 98 of 100 at every save from 1,500 to 3,500 iterations. At seed 0, from 4,000 on, the
 control's R lies between 58 and 90 and is 60 at 7,000, while its E lies between 0.0295 and 0.0313 m.
 
-**Training time.** Seconds from `process_start.txt` to the file time of `ckpt_007000.pt`; before the first iteration,
-that total minus the checkpoint's `wall_time` (the trainer's clock, which starts after its warm-up collection); the
-steady rate, between the first and the last numbered checkpoint; and the start-up, the first numbered checkpoint's time
-(606 to 619 s from launch) minus its 100 iterations at the steady rate:
+**Training time.** Seconds from `process_start.txt` to the file time of `ckpt_007000.pt`; the steady rate, between the
+first and the last numbered checkpoint; and the start-up, the first numbered checkpoint's time (606 to 619 s from
+launch) minus its 100 iterations at the steady rate:
 
-| Training | Launch to the last checkpoint (s) | Before the first iteration (s) | Start-up (s) | Steady (s per iteration) |
-| --- | --- | --- | --- | --- |
-| control, seed 0 | 1,504.8 | 140.3 | 598.2 | 0.1295 |
-| control, seed 1 | 1,500.5 | 140.5 | 593.1 | 0.1296 |
-| recovery, seed 0 | 1,546.1 | 141.2 | 605.8 | 0.1343 |
-| recovery, seed 1 | 1,544.1 | 140.8 | 603.5 | 0.1344 |
+| Training | Launch to the last checkpoint (s) | Start-up (s) | Steady (s per iteration) |
+| --- | --- | --- | --- |
+| control, seed 0 | 1,504.8 | 598.2 | 0.1295 |
+| control, seed 1 | 1,500.5 | 593.1 | 0.1296 |
+| recovery, seed 0 | 1,546.1 | 605.8 | 0.1343 |
+| recovery, seed 1 | 1,544.1 | 603.5 | 0.1344 |
 
 The four trainings together take 6,095.5 s.
 
@@ -370,52 +379,89 @@ The four trainings together take 6,095.5 s.
 Besides the trainer, the two studies differ in the simulator and the robot's collision model (MuJoCo Warp with mjlab's
 G1 against NablaEngine with Menagerie's G1), in the motion library's resampling of the same 40 clips, so the scene's
 rule lands on other rows, and in the unit of training (iterations against updates), so equal counts are not equal
-training. C and the span over which E is averaged follow each trainer's own termination, pelvis-anchored here.
+training. C and the span over which E is averaged follow each trainer's termination: the same formula, each against
+its own library's rows ("Ends on get-up clips" below).
 
-The bands and the time criteria were fixed before these trainings, outside `pair.json`: the bands from NablaMimic's
-final saves, the criteria with NablaMimic's numbers. The control band and the control criterion were fixed after
-control trainings of this configuration on another card had been read, and this trainer's rate (7.6 iterations per
-second) and its start-up of about 10 minutes from launch to the 100th checkpoint were known before the two clocks were
-fixed, so neither the control comparisons nor the clocks are blind. The recovery bands and criterion were fixed before
-the get-ups of any recovery policy of this trainer had been read.
+On the same card, from launch to the last checkpoint, NablaMimic's trainings take 1,784 and 1,781 s (control, seeds 0
+and 1) and 1,804 and 1,806 s (recovery); against this study's totals above the ratios, taken before the seconds are
+rounded, are 0.84, 0.84, 0.86 and 0.86 (the printed seconds give 0.855 for recovery seed 1). NablaMimic's seconds are
+computed by the same rule from the file times of its trainings' launch and checkpoints; its README gives only the
+from-launch times at its criteria and the trainer's own totals, which start about 20 s later. By the NablaMimic study's
+control criterion (the first save on its grid, every 500 iterations here and 250 updates there, with C ≥ 38 and
+E ≤ 0.0341 m), a control first tracks at 3,000 iterations here, 986 and 981 s from launch, and at 1,750 updates there,
+1,107 and 1,105 s: ratios 0.89 and 0.89. Both trainers started with empty compile caches; this trainer's start-up is
+about 600 s (table above), and no time with a pre-built cache is measured here. NablaMimic's recovery criterion (R ≥ 50,
+R at least the larger control R at the last save plus 20, J over R ≥ 0.5) needs R ≥ 111 here, so it gives no time.
 
-| Band at 7,000 iterations | Seed 0 | Seed 1 |
-| --- | --- | --- |
-| recovery R over the starts inside the fall rule ≥ 0.90 | 99 / 99, holds | 97 / 98, holds |
-| recovery rejoined over got up ≥ 0.89 | 98 / 98, holds | 97 / 97, holds |
-| recovery F ≤ 2 | 1, holds | 0, holds |
-| recovery C ≥ 37 | 36, missed | 39, holds |
-| recovery minus control E ≤ +0.0151 m | +0.0092 m, holds | +0.0096 m, holds |
-| control C ≥ 38 and E ≤ 0.0341 m | 40, 0.0296 m, holds | 39, 0.0292 m, holds |
+**Repeated rollouts of one checkpoint (exploratory).** Control seed 0 and recovery seed 0 at 7,000 each have three
+further sets of three rollouts (placed starts, twins, first rows) on the same scene files, read by `readings.py`; the
+first value in each cell is from the study's own set:
 
-The two studies were to be called comparable only if every band held at both seeds; one band is missed at seed 0 (C 36
-against at least 37), so "comparable" is not called; the other five hold at both seeds.
+| Save | R | J | F | C | E (m) |
+| --- | --- | --- | --- | --- | --- |
+| control, seed 0, 7,000 | 60, 64, 65, 62 | 58, 62, 61, 59 | 0, 0, 1, 0 | 40, 40, 40, 39 | 0.0296 in all four |
+| recovery, seed 0, 7,000 | 99 in all four | 98, 97, 97, 98 | 1, 2, 1, 1 | 36, 38, 36, 38 | 0.0388, 0.0377, 0.0382, 0.0377 |
 
-Times on the same card run from launch to the checkpoint's file time; after start-up is that time minus the training's
-start-up (above; 157 to 171 s for NablaMimic). NablaMimic's times after start-up, to the last checkpoint and its
-start-ups are computed by the same rule from the file times of its trainings' launch and checkpoints; its README gives
-only the from-launch times at its criteria and the trainer's own totals, which start about 20 s later. A control
-tracks at the first save on its grid (500 iterations here, 250 updates there) with C ≥ 38 and E ≤ 0.0341 m. The
-recovery criterion (R ≥ 50, J over R ≥ 0.5 and R at least the larger control R at 7,000 plus 20) cannot be met here,
-as for the class gets_up above. The exploratory rows put R ≥ 80 in place of its last term; 80 was chosen after the
-readings were seen, and the controls of this study meet it first, at 1,500 iterations (R 93 and 98, J over R 91 / 93
-and 98 / 98; 792 s and 787 s from launch), so these rows do not time a get-up attributable to recovery training.
+The control's get-up count is a property of the checkpoint (60 to 65 of 100), but per start it is not fixed: 40 starts
+get up in all four sets and 12 in none. The recovery policy gets up from the same 99 starts in all four. Its C reads
+36, 38, 36 and 38, so a difference of two clips between saves is inside the spread of rollouts of one checkpoint. Of
+its 12 clip ends over the four first-row rollouts, 10 are on the six get-up clips excluded from its commands (below);
+fallAndGetUp3_subject1 ends in all four.
 
-| Seconds, seed 0 / seed 1 | Here | NablaMimic | Ratio |
+**Nearly the same placed starts on both trainers (exploratory).** Placed start i of the two studies comes from the same
+body clip in 100 of 100 trials; the absolute differences of the placed states have medians of 0.017 m in pelvis height
+and 3.2° in tilt; the pelvis-height quartiles are 0.128, 0.213 and 0.394 m here against 0.137, 0.200 and 0.417 m there;
+and the counts per height bin, tilt bin and lying orientation agree within 3. So the controls' get-ups here (60 and 91
+at 7,000, 98 at seed 0, 2,000 iterations) against 31 and 32 there at 3,000 updates are not a difference of the placed
+starts.
+
+**Commanded and excluded clips (exploratory).** The recovery policies' commands exclude six get-up clips (the five
+hidden clips and fallAndGetUp1_subject4). The final saves, one rollout each; E over a group is the mean of its clips'
+errors, each read up to the clip's first termination:
+
+| Final save, seed 0 / seed 1 | Completed of 34 commanded | E over 34 (m) | Completed of 6 excluded | E over 6 (m) |
+| --- | --- | --- | --- | --- |
+| this study, control, 7,000 | 34 / 33 | 0.0279 / 0.0273 | 6 / 6 | 0.0393 / 0.0397 |
+| this study, recovery, 7,000 | 33 / 34 | 0.0349 / 0.0358 | 3 / 5 | 0.0606 / 0.0554 |
+| NablaMimic, control, 3,000 updates | 34 / 34 | 0.0268 / 0.0272 | 6 / 6 | 0.0389 / 0.0400 |
+| NablaMimic, recovery, 3,000 updates | 33 / 34 | 0.0362 / 0.0357 | 6 / 6 | 0.0527 / 0.0528 |
+
+**Ends on get-up clips (exploratory).** In the recovery first-row rollouts here, trials end on the excluded clips 10
+times over the four rollouts of seed 0 at 7,000 (8 on the tilt term, 2 on the height term; not independent), once at
+seed 1 at 7,000 (height), once at seed 0 at 3,500 (tilt) and once at seed 1 at 3,500 (height). In each the body had
+gone down with the reference; in the four height-term ends it then rose and sank back (three) or rose more slowly than
+the reference (one). The end came before the reference left its low span or 13 to 36 controls after, inside a get-up
+as defined below, and on the term that ended the trial the reference was higher or more upright than the body. Both
+trainers end a trial by one formula: pelvis-height difference above 0.25 m or up-axis z difference above 0.8, against
+the command row after the control. Applied to the other study's records at 7,000 and 3,500 iterations here and 3,000
+updates there, each rule gives that study's ends on these clips: none in NablaMimic (the closest trial 0.0024 m under
+the height threshold, against its own library's rows), and here each end at the same control or 1 to 6 controls
+before.
+
+Ends per get-up of the reference, a get-up being the window from 50 rows before to 50 rows after the end of a low span
+of at least 25 rows (a low row: pelvis below 0.50 m or up-axis z below 0.5; overlapping windows counted separately),
+over the windows the trials reached. The four rollouts of one checkpoint are summed and are not independent;
+NablaMimic gives one rollout per seed:
+
+| Save | Five hidden clips | fallAndGetUp1_subject4 | 12 commanded clips with a get-up |
 | --- | --- | --- | --- |
-| control tracks, from launch | 986 / 981 (3,000 iterations; C 39 / 39, E 0.0331 / 0.0337 m) | 1,107 / 1,105 (1,750 updates) | 0.89 / 0.89 |
-| control tracks, after start-up | 388 / 388 | 950 / 947 | 0.41 / 0.41 |
-| *exploratory:* recovery R ≥ 80, from launch | 873 / 871 (2,000 iterations; R 87, 82) | 442 / 443 (500 updates; R 97, 97) | 2.0 / 2.0 |
-| *exploratory:* recovery R ≥ 80, after start-up | 267 / 268 | 272 / 272 | 0.98 / 0.98 |
+| recovery, 7,000: seed 0 (four rollouts) / seed 1 (one) | 8 in 284 / 1 in 80 | 2 in 66 / 0 in 17 | 0 in 167 / 0 in 43 |
+| control, 7,000: seed 0 (four rollouts) / seed 1 (one) | 0 in 364 / 0 in 91 | 0 in 68 / 0 in 17 | 0 in 169 / 0 in 43 |
+| NablaMimic recovery, 3,000 updates: seed 0 / seed 1 | 0 in 92 / 0 in 92 | 0 in 19 / 0 in 19 | 0 in 43 / 0 in 44 |
+| NablaMimic recovery, 1,500 updates: seed 0 / seed 1 | 0 in 74 / 1 in 87 | 1 in 17 / 0 in 19 | 0 in 44 / 0 in 43 |
 
-By the declared call, a ratio below 1 at both seeds, this trainer's control is faster on both clocks; the recovery
-criterion is not met, so it has no time and no call. From launch to the last checkpoint NablaMimic's trainings take
-1,784 and 1,781 s (control) and 1,804 and 1,806 s (recovery), ratios 0.84, 0.84, 0.86 and 0.86. Every ratio, here
-and in the table, is taken before the seconds are rounded.
+The same pattern appears at other saves: this study's controls end 14 times on the excluded clips between 2,000 and
+6,500 iterations (7 at each seed; 13 of them inside a get-up window), each with the reference higher or more upright
+on the ending term, and NablaMimic's recovery policies end on fallAndGetUp1_subject1, fallAndGetUp1_subject4 and
+fallAndGetUp3_subject1 at 1,500 updates (one of these inside a low span, outside any window) and on none at 3,000. The
+cause of these ends is not established.
 
 **What the results do not show.** Beyond "What the study does not show" above:
 
 - A class for the recovery policies' getting up (see the outcome).
 - A tracking comparison at equal exposure and equal iterations.
-- The saves at every 500 iterations, the exposure comparison, the bands and the times are not part of the outcome.
-- The times hold for one card, the RTX 4090 with 48 GB at 350 W.
+- The saves at every 500 iterations, the exposure comparison, the times and the four exploratory readings after them
+  are not part of the outcome.
+- A cause of the ends on get-up clips, or a rate of them with an interval: the repeated rollouts are of one checkpoint
+  per condition, at seed 0.
+- The times hold for one card, the RTX 4090 with 48 GB at 350 W, with empty compile caches.
