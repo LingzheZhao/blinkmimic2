@@ -364,4 +364,7 @@ and (c) 2026 ETH Zurich, Chong Zhang. Data-derived files are excluded; see above
   of the reset noise ([`env.placed_state`](src/blinkmimic2/env.py)); without them it draws as before.
 - [`tools/rollouts.py`](tools/rollouts.py) rolls a checkpoint's policy out from placed starts and records every
   control: [ROLLOUTS.md](ROLLOUTS.md).
+- `TrackingSim` takes mjlab entities and sensors added beside the robot and a function called after every physics
+  substep ([ROLLOUTS.md](ROLLOUTS.md#added-entities-sensors-and-a-function-after-each-substep)); without them its
+  mjlab scene and its step are the release's.
 - [`tests/`](tests): unit tests that run on the CPU, `python -m unittest discover -s tests`.

@@ -58,6 +58,23 @@ observation therefore differs from `tools/evaluate.py`'s by rounding. The action
 noise. The observation history (`hist` observations) starts filled with the first
 observation; the goal is `motion.goal` of the command row.
 
+### Added entities, sensors and a function after each substep
+
+`TrackingSim` takes three more keyword arguments; `tools/rollouts.py` passes none of them, and without them the
+simulator's mjlab scene and its step are the release's.
+
+- `scene_entities` (name -> mjlab `EntityCfg`) and `scene_sensors` (mjlab `SensorCfg`s) are added to the mjlab scene
+  by `make_scene_cfg` after the plane terrain and the robot, so the robot keeps its indices in the compiled model. The
+  names `robot` and `terrain` are refused. The randomizer writes the friction of the robot's geoms and of the world
+  body's geoms only ([`dr.py`](src/blinkmimic2/dr.py)), so an added entity's geoms keep their own contact
+  parameters. Camera and ray-cast sensors are refused, since `TrackingSim` does not run mjlab's sense pipeline.
+  `reset_masked` resets the robot only and refuses an mjlab scene with added entities or sensors.
+- `after_substep` is called with the simulator after each of the four physics substeps of a step, after
+  `scene.update` (which clears the cache of mjlab's sensor data) and before the sensing filter's update. MuJoCo's
+  step computes the derived quantities, sensor data included, before it integrates, so the sensor data the function
+  reads describe the state at the start of that substep, not the state after it. It runs inside `step_core`; to keep
+  the step capturable in a CUDA graph, the function must write in place into tensors allocated before the capture.
+
 ## Scene
 
 `{"trials": [TRIAL, ...]}`, at least one trial; unknown keys are refused at every level. A trial holds:
@@ -192,9 +209,18 @@ every world of the batch when the pooled contact array overflows.
   root velocity, from its control on, and is not applied after the trial's end;
 - the command line's refusals of an existing output directory and of zero controls;
 - `train.py --motion_dir`: refused with a non-empty `--bones_list`; the library `tools/evaluate.py` builds from such
-  a run's `args.json` is the folder's clips; a folder without motion files is refused.
+  a run's `args.json` is the folder's clips; a folder without motion files is refused;
+- the added entities, sensors and function: with the defaults, `make_scene_cfg` and `TrackingSim` give the release's
+  mjlab scene configuration field by field, and MuJoCo compiles it on the CPU to the release's model byte for byte; an
+  added mocap box and contact sensor leave the robot's part of the compiled model unchanged; the names `robot` and
+  `terrain`, `reset_masked` with additions, and camera or ray-cast sensors are refused, and `reset_masked` passes its
+  new check on the default scene; `TrackingSim.step_core` without a function makes the release's calls in the
+  release's order, and with one calls it after each scene update and before the sensing filter's update and returns
+  the same values. The release's scene configuration is written out in the test, not run from the release's code.
 
 They leave out what needs the simulator and a GPU: `rollouts.Simulator` (the placement through `TrackingSim.reset`,
 pushes written to the simulator, the command row held through `TrackingSim.step`, and the reading of MuJoCo Warp's
 counts and overflow bits), `main` (loading the run, the checkpoint and the library, the rounding of the products
-under TF32, and the files written) and `train.py` passing `--motion_dir` to the library (it trains once parsed).
+under TF32, and the files written), `train.py` passing `--motion_dir` to the library (it trains once parsed), and a
+step on MuJoCo Warp with added entities, sensors or a function (its model and data with them, a mocap pose written
+per world, the sensor data read in the function, the step captured in a CUDA graph).

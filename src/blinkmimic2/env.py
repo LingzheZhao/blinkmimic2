@@ -8,12 +8,16 @@ reference-motion states drawn by return-based bin sampling (paper Appendix D.1).
 
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 import mujoco_warp as mjwarp
 import warp as wp
+from mjlab.entity import EntityCfg
 from mjlab.entity.data import EntityData
 from mjlab.utils.lab_api.math import quat_apply_inverse
 from mjlab.scene import Scene, SceneCfg
+from mjlab.sensor import SensorCfg
 from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
 
@@ -59,12 +63,20 @@ DECIMATION = 4  # 4 physics substeps of 5 ms per 50 Hz control step
 PHYSICS_DT = CONTROL_DT / DECIMATION
 
 
-def make_scene_cfg(robot: RobotSpec, num_envs: int) -> SceneCfg:
+def make_scene_cfg(robot: RobotSpec, num_envs: int, entities: dict[str, EntityCfg] | None = None,
+                   sensors: tuple[SensorCfg, ...] = ()) -> SceneCfg:  # fmt: skip
+    """The plane terrain and the robot (entity "robot"), then the mjlab entities ``entities`` (name -> EntityCfg),
+    attached after the robot in this order, and the mjlab sensors ``sensors``. The defaults give the terrain and the
+    robot only."""
+    entities = entities or {}
+    if {"robot", "terrain"} & set(entities):
+        raise ValueError(f"the scene names 'robot' and 'terrain' are taken: {list(entities)}")
     return SceneCfg(
         num_envs=num_envs,
         env_spacing=0.0,
         terrain=TerrainEntityCfg(terrain_type="plane"),
-        entities={"robot": robot.robot_cfg()},
+        entities={"robot": robot.robot_cfg(), **entities},
+        sensors=tuple(sensors),
     )
 
 
@@ -136,14 +148,22 @@ class TrackingSim:
 
     def __init__(self, sim_cfg: SimulationCfg, num_envs: int, robot: RobotSpec, motion: MotionLib, mdp: MDP,
                  device: str, gamma: float = 0.99, eval_mode: bool = False, max_episode_steps: int = 500,
-                 reset_noise: bool = True, randomize: bool | None = None, fail_reset: float = 0.0, bin_fix: bool = False):  # fmt: skip
+                 reset_noise: bool = True, randomize: bool | None = None, fail_reset: float = 0.0, bin_fix: bool = False,
+                 scene_entities: dict[str, EntityCfg] | None = None, scene_sensors: tuple[SensorCfg, ...] = (),
+                 after_substep: Callable[[TrackingSim], None] | None = None):  # fmt: skip
         """``randomize`` (default: not eval_mode) switches domain randomization, observation noise and
         delay, and pushes; ``eval_mode`` switches evaluation bookkeeping (no auto-reset, episode starts
-        exactly on the reference)."""
+        exactly on the reference). ``scene_entities`` and ``scene_sensors`` are added to the scene beside the robot
+        (:func:`make_scene_cfg`); ``after_substep``, if given, is called with this simulator after every physics
+        substep of a step, once the scene's update has run."""
         self.device = device
-        self.scene = Scene(make_scene_cfg(robot, num_envs), device=device)
+        self.scene_cfg = make_scene_cfg(robot, num_envs, scene_entities, scene_sensors)
+        self.scene = Scene(self.scene_cfg, device=device)
         self.sim = Simulation(num_envs=num_envs, cfg=sim_cfg, model=self.scene.compile(), device=device)
         self.scene.initialize(mj_model=self.sim.mj_model, model=self.sim.model, data=self.sim.data)
+        if self.scene.sensor_context is not None:
+            raise ValueError("camera and ray-cast sensors need mjlab's sense pipeline, which TrackingSim does not run")
+        self.after_substep = after_substep
         self.robot = self.scene["robot"]
         assert list(self.robot.joint_names) == list(robot.joint_names), self.robot.joint_names
         self.N = num_envs
@@ -402,7 +422,9 @@ class TrackingSim:
         it can be captured in a CUDA graph). Worlds outside the mask are left bitwise unchanged; the reset worlds get the
         same values as reset() would give them for the same frames and random draws (random draws are made for all
         worlds, so the random stream differs from reset()). Only the configuration used here is supported: no pushes,
-        no sensing state, no per-episode mjlab randomization terms, no actuator delays, no audit."""
+        no sensing state, no per-episode mjlab randomization terms, no actuator delays, no audit, no scene entities or
+        sensors beside the robot."""
+        assert list(self.scene_cfg.entities) == ["robot"] and not self.scene_cfg.sensors, "reset_masked resets the robot only"
         assert not self.eval_mode and self.audit is None and not self.pipe.stateful and not self.push_enabled
         assert not self.randomizer._terms and self.spec.dr.solref_geoms is None and self.spec.dr.com_mass_range is None
         N, dev, m, c = self.N, self.device, self.motion, self.spec.dr
@@ -575,6 +597,8 @@ class TrackingSim:
             self.scene.write_data_to_sim()
             self.sim.step()
             self.scene.update(PHYSICS_DT)
+            if self.after_substep is not None:
+                self.after_substep(self)
             if self.pipe.stateful:
                 gyro, accel = self._imu_site() if self.spec.sensing.imu is not None else (None, None)
                 self._obs_state = self.pipe.filter_update(self._obs_state, self.robot.data.joint_vel, gyro, accel, self.xi,
