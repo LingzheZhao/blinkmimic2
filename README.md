@@ -24,6 +24,9 @@ scored by our evaluation. Sources: [SuperMimic](https://arxiv.org/abs/2610.28480
 [realmimic](https://github.com/kevinhenryzz/realmimic),
 [SuperMimic-Rep](https://github.com/LaoYang1994/SuperMimic-Rep),
 [supermimic_vibe](https://github.com/dhmbb2/supermimic_vibe),
+[UniSuperMimic](https://github.com/Motphys/Uni-SuperMimic),
+[Camtrixxx/SuperMimic](https://github.com/Camtrixxx/SuperMimic),
+[A100Supermimic](https://github.com/Hzzzzs/A100Supermimic),
 [SONIC](https://doi.org/10.1126/scirobotics.aed4592) (as scored by SuperMimic).*
 
 ![Backflip, hip-hop dance, high jump, fall and get up](docs/media/hero.gif)
