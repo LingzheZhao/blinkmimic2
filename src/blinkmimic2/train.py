@@ -4,9 +4,11 @@ frontier practice, a deployment stream and a step size planned for the budget. T
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 import time
 
@@ -33,6 +35,10 @@ parser.add_argument("--motion_dir", type=os.path.abspath, default=None,
 parser.add_argument("--motion_store", type=str, default="fp32", choices=["full", "fp32", "fp16"],
                     help="full: every per-frame quantity precomputed; fp32 / fp16: root pose and joints only, the rest computed when indexed")
 parser.add_argument("--robot", type=str, default="mjlab_g1", help="robot package under blinkmimic2/ (mjlab_g1: the G1 as mjlab ships it)")
+parser.add_argument("--joint_offset", type=str, nargs="+", default=None, metavar="PATTERN=HALF",
+                    help="half-range (rad) of the per-episode default joint position offset of the joints whose names match "
+                         "the regular expression PATTERN; a joint takes the last pattern it matches, a joint matching none "
+                         "gets no offset (default: the robot's ranges, 0.01 on every joint of the G1)")
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 # ---- learner (SuperMimic with the BlinkMimic changes) ----
 parser.add_argument("--num_envs", type=int, default=4096)
@@ -117,6 +123,20 @@ parser.add_argument("--wstream_burn", type=int, default=300, help="stream advanc
 args = parser.parse_args()
 if args.motion_dir and args.bones_list:
     parser.error("--motion_dir is read only with an empty --bones_list (--bones_list=)")
+JOINT_OFFSET = None  # --joint_offset: pattern -> half-range, in the order given
+if args.joint_offset is not None:
+    JOINT_OFFSET = {}
+    for item in args.joint_offset:
+        pat, _, half = item.rpartition("=")
+        try:
+            re.compile(pat)
+            ok = bool(pat) and pat not in JOINT_OFFSET and 0 <= float(half) < math.inf
+        except (re.error, ValueError):
+            ok = False
+        if not ok:
+            parser.error(f"--joint_offset {item}: needs PATTERN=HALF, a regular expression not given before and a "
+                         "half-range >= 0 (rad)")
+        JOINT_OFFSET[pat] = float(half)
 
 import torch
 import torch.nn as nn
@@ -142,10 +162,15 @@ torch.backends.cudnn.allow_tf32 = True
 torch.manual_seed(args.seed)
 networks.AMP_DTYPE = torch.bfloat16 if args.amp == "bf16" else None
 dev = "cuda:0"
+robot = get_robot(args.robot)
+if JOINT_OFFSET is not None:
+    for pat in JOINT_OFFSET:
+        if not any(re.fullmatch(pat, n) for n in robot.joint_names):
+            parser.error(f"--joint_offset: {pat} matches no joint of {args.robot}")
+    robot = dataclasses.replace(robot, dr=dataclasses.replace(robot.dr, joint_offset=JOINT_OFFSET))
 os.makedirs(args.log_dir, exist_ok=True)
 json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
 
-robot = get_robot(args.robot)
 J = robot.num_joints
 kin = Kinematics(robot, dev)
 motion = MotionLib.load(robot, kin, dev, args.motion_dir, args.bones_list, args.bones_lib, args.motion_store)
