@@ -1,6 +1,7 @@
 """Evaluate checkpoints on a list of BONES-SEED clips: every clip once, from its first frame, in the evaluation-mode
 simulator (no randomization, no reset noise, a_prev = 0), with the checkpoint's deployed policy. Return = tracking reward
-summed while alive, normalized by the clip length; failure = termination before the clip ends.
+summed while alive, normalized by the clip length; failure = termination before the clip ends, by the release's
+termination on the root (MDP.termination of the default RewardCfg), whatever train.py --termination the run used.
 
 A world that finishes its clip is reset onto the next clip of a queue (longest first), so a pass takes about
 max(max_len, sum_len / W) steps of W worlds per checkpoint. The simulator is not bitwise reproducible across batch
