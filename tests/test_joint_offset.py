@@ -76,6 +76,12 @@ class TestCommandLine(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn(".*_ancle_.* matches no joint of mjlab_g1", r.stderr)
 
+    def test_a_joint_matching_no_pattern_is_refused(self):
+        r = self.call("--joint_offset", ".*_ankle_.*=0.1")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("match no pattern", r.stderr)
+        self.assertNotIn("ankle", r.stderr.split("match no pattern")[0].split("the joints")[-1])
+
 
 if __name__ == "__main__":
     unittest.main()

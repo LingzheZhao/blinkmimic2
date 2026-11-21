@@ -37,8 +37,8 @@ parser.add_argument("--motion_store", type=str, default="fp32", choices=["full",
 parser.add_argument("--robot", type=str, default="mjlab_g1", help="robot package under blinkmimic2/ (mjlab_g1: the G1 as mjlab ships it)")
 parser.add_argument("--joint_offset", type=str, nargs="+", default=None, metavar="PATTERN=HALF",
                     help="half-range (rad) of the per-episode default joint position offset of the joints whose names match "
-                         "the regular expression PATTERN; a joint takes the last pattern it matches, a joint matching none "
-                         "gets no offset (default: the robot's ranges, 0.01 on every joint of the G1)")
+                         "the regular expression PATTERN; a joint takes the last pattern it matches, and every joint must "
+                         "match one ('.*=0' gives no offset) (default: the robot's ranges, 0.01 on every joint of the G1)")
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 # ---- learner (SuperMimic with the BlinkMimic changes) ----
 parser.add_argument("--num_envs", type=int, default=4096)
@@ -167,6 +167,9 @@ if JOINT_OFFSET is not None:
     for pat in JOINT_OFFSET:
         if not any(re.fullmatch(pat, n) for n in robot.joint_names):
             parser.error(f"--joint_offset: {pat} matches no joint of {args.robot}")
+    unmatched = [n for n in robot.joint_names if not any(re.fullmatch(pat, n) for pat in JOINT_OFFSET)]
+    if unmatched:
+        parser.error(f"--joint_offset: the joints {unmatched} match no pattern (give '.*=0' first for no offset)")
     robot = dataclasses.replace(robot, dr=dataclasses.replace(robot.dr, joint_offset=JOINT_OFFSET))
 os.makedirs(args.log_dir, exist_ok=True)
 json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
