@@ -67,13 +67,13 @@ def body_rule(S, f, motion, h: float = 0.25):
 
 
 def random_states(motion, n: int, seed: int):
-    """Reference states of random frames with the root moved by up to 0.15 m, turned by up to 0.75 rad about each axis
+    """Reference states of random frames with the root moved by up to 0.4 m, turned by up to 0.75 rad about each axis
     and the joints moved by up to 0.5 rad."""
     g = torch.Generator().manual_seed(seed)
     u = lambda *shape: 2 * torch.rand(*shape, generator=g) - 1  # noqa: E731
     f = torch.randint(0, motion.num_frames, (n,), generator=g)
     p, R, v, w, q, qd = (x.clone() for x in motion.ref_state(f))
-    return (p + 0.15 * u(n, 3), so3_exp(0.75 * u(n, 3)) @ R, v, w, q + 0.5 * u(n, q.shape[-1]), qd), f
+    return (p + 0.4 * u(n, 3), so3_exp(0.75 * u(n, 3)) @ R, v, w, q + 0.5 * u(n, q.shape[-1]), qd), f
 
 
 def at_frame(motion, f: int, joints: dict | None = None, pitch: float = 0.0):
