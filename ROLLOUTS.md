@@ -21,7 +21,7 @@ python tools/rollouts.py --run_dir logs/run_s1 --ckpt 6500 --scene scene.json --
 | `--run_dir` | run directory of `blinkmimic2.train` (`args.json`, `ckpt_NNNNNN.pt`) |
 | `--ckpt` | iteration N of the checkpoint `ckpt_NNNNNN.pt` (six digits) |
 | `--scene` | scene file (JSON), below |
-| `--termination` | `recipe` (the training recipe's termination) or `nonfinite` (only a non-finite state), below |
+| `--termination` | `root` (the release's termination on the root) or `nonfinite` (only a non-finite state), below |
 | `--controls` | controls per trial, at least 1 |
 | `--out` | output directory; it must not exist |
 
@@ -94,13 +94,14 @@ of the state is unchanged. The policy sees the push from control `c + 1` on.
 
 ## Terminations
 
-- `--termination recipe`: the release's termination (`MDP.termination` in [`mdp.py`](src/blinkmimic2/mdp.py))
+- `--termination root`: the release's termination (`MDP.termination` in [`mdp.py`](src/blinkmimic2/mdp.py) with
+  the default `RewardCfg`, whatever `train.py --termination` the run trained with)
   against the command row after the control ends a trial: the root height differs from the command root's by more
   than 0.25 m, or the z component of the root's z axis (the cosine of its tilt from upright) differs from the
   command root's by more than 0.8. A non-finite state also ends a trial.
 - `--termination nonfinite`: only a non-finite state ends a trial.
 
-Under `recipe` a body placed lying at an upright command ends at its first control, so placed lying starts are run
+Under `root` a body placed lying at an upright command ends at its first control, so placed lying starts are run
 with `nonfinite`. Neither a clip's end nor the training episode limit ends a trial.
 
 A trial that has ended is placed again at its start before every later control and acts with zero actions, so the
@@ -186,7 +187,7 @@ every world of the batch when the pooled contact array overflows.
 - the rollout loop: each record field's shape and type; the record holds the stepped state, the command's bodies and
   the step's counts and flags; the uniforms reach the placement; the command row advances and holds at the last row
   of its own clip without ending a trial, in three clips of one batch; the height and tilt terms each end a trial under
-  `recipe`, also just beyond their thresholds and not just within them, and equal `MDP.termination`; a non-finite
+  `root`, also just beyond their thresholds and not just within them, and equal `MDP.termination`; a non-finite
   state ends a trial under both terminations, the trial is placed again and its later records are unavailable; an
   ended trial leaves the other trials' records equal to a batch without it; a push changes only its trial's planar
   root velocity, from its control on, and is not applied after the trial's end;

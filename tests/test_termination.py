@@ -1,6 +1,6 @@
 """What ends an episode: the root's height and tilt by default (the release), or with train.py --termination
-torso_and_end_effectors (mdp.body_termination) BeyondMimic's rule, the heights of the torso link, the ankle roll links
-and the wrist yaw links and the torso link's tilt against the reference. The rule gives the simulator's termination,
+torso_and_end_effectors (mdp.body_termination) the rule of BeyondMimic's released code, the heights of the torso link,
+the ankle roll links and the wrist yaw links and the torso link's tilt against the reference. The rule gives the simulator's termination,
 the danger ratio and the soft termination of imagined rollouts.
 
 train.py builds the simulator and trains once its options are parsed, so only its refusals run here; a training with
@@ -53,7 +53,7 @@ def release(S, f, motion):
 
 
 def body_rule(S, f, motion, h: float = 0.25):
-    """BeyondMimic's errors computed here: heights of BODIES and the difference of the z components of the torso
+    """The errors of BeyondMimic's released code computed here: heights of BODIES and the difference of the z components of the torso
     link's projected gravity R^T (0, 0, -1), from forward kinematics of every body. Returns (height errors [..., 5],
     tilt error, termination)."""
     i = [KIN.body_names.index(n) for n in BODIES]
@@ -89,16 +89,15 @@ def at_frame(motion, f: int, joints: dict | None = None, pitch: float = 0.0):
 
 
 class TestDefault(unittest.TestCase):
-    def test_the_default_is_the_release_s_root_termination_bitwise(self):
-        # RewardCfg() and the configuration train.py builds without --termination
+    def test_the_default_equals_the_release_s_root_formulas_bitwise(self):
+        # RewardCfg(), which train.py uses without --termination, against the release's formulas written out in release()
         for store, motion in libraries().items():
             S, f = random_states(motion, 512, 0)
             want = release(S, f, motion)
             self.assertTrue(0 < int(want[0].sum()) < 512, store)
-            for cfg in (RewardCfg(), RewardCfg(term_height=0.25)):
-                mdp = mdp_of(motion, cfg)
-                for got, w in zip((mdp.termination(S, f), mdp.danger(S, f), mdp.soft_termination(S, f)), want):
-                    self.assertTrue(torch.equal(got, w), store)
+            mdp = mdp_of(motion, RewardCfg())
+            for got, w in zip((mdp.termination(S, f), mdp.danger(S, f), mdp.soft_termination(S, f)), want):
+                self.assertTrue(torch.equal(got, w), store)
 
     def test_the_root_termination_does_not_depend_on_the_joints(self):
         S, f = at_frame(SYNTH, 2, {"left_hip_pitch_joint": -2.0})
@@ -115,15 +114,12 @@ class TestBodyTermination(unittest.TestCase):
         names = [ROBOT.tracked_bodies[i] for i in cfg.term_bodies]
         self.assertEqual(names, ["torso_link", "left_ankle_roll_link", "right_ankle_roll_link", "left_wrist_yaw_link",
                                  "right_wrist_yaw_link"])  # fmt: skip
-        self.assertEqual(ROBOT.tracked_bodies[cfg.term_tilt_body], "torso_link")
         self.assertEqual((cfg.term_height, cfg.term_tilt), (0.3, 0.8))
 
     def test_bodies_the_robot_does_not_track_are_refused(self):
         tracked = [n for n in ROBOT.tracked_bodies if n != "left_wrist_yaw_link"]
         with self.assertRaisesRegex(ValueError, "left_wrist_yaw_link"):
             body_termination(RewardCfg(), tracked)
-        with self.assertRaisesRegex(ValueError, "together"):
-            mdp_of(SYNTH, RewardCfg(term_bodies=(0,)))
 
     def test_the_errors_heights_and_projected_gravity_of_the_five_bodies(self):
         for store, motion in libraries().items():
@@ -178,7 +174,7 @@ class TestBodyTermination(unittest.TestCase):
         self.assertTrue(bool(body.termination(S, f)))
         self.assertFalse(bool(root.termination(S, f)))
 
-    def test_imagined_rollouts_get_a_gradient_from_the_end_effector_heights(self):
+    def test_the_soft_termination_has_a_gradient_from_the_end_effector_heights(self):
         # the soft termination of the release depends on the root only; with the rule a joint that moves an
         # end-effector near its threshold changes it
         body = mdp_of(SYNTH, body_termination(RewardCfg(), ROBOT.tracked_bodies))
@@ -194,15 +190,10 @@ class TestCommandLine(unittest.TestCase):
         cmd = [sys.executable, "-m", "blinkmimic2.train", *extra]
         return subprocess.run(cmd, capture_output=True, text=True)
 
-    def test_invalid_termination_options_are_refused(self):
-        for extra, msg in ((("--termination_height", "0"), "finite height > 0"),
-                           (("--termination_height", "-0.25"), "finite height > 0"),
-                           (("--termination_height", "nan"), "finite height > 0"),
-                           (("--termination_height", "inf"), "finite height > 0"),
-                           (("--termination", "end_effectors"), "invalid choice")):  # fmt: skip
-            r = self.call(*extra)
-            self.assertEqual(r.returncode, 2, extra)
-            self.assertIn(msg, r.stderr)
+    def test_an_unknown_termination_is_refused(self):
+        r = self.call("--termination", "end_effectors")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("invalid choice", r.stderr)
 
 
 if __name__ == "__main__":

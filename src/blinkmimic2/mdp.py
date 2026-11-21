@@ -48,29 +48,28 @@ class RewardCfg:
     soft_limit_factor: float = 0.9
     term_height: float = 0.25
     term_tilt: float = 0.8
-    # tracked-body indices whose height errors end an episode, and the tracked body whose tilt error does (MDP.termination);
-    # empty and None: the root's height and tilt
+    # tracked-body indices whose height errors end an episode, the first of which also ends it by its tilt error
+    # (MDP.termination); empty: the root's height and tilt
     term_bodies: tuple[int, ...] = ()
-    term_tilt_body: int | None = None
 
 
-# BeyondMimic's termination on the G1 (body_termination): the anchor, the torso link, whose height and tilt are tested,
-# and the end-effectors, the ankle roll and wrist yaw links, whose heights are tested
+# The termination of BeyondMimic's released code on the G1 (body_termination): the height and tilt of its anchor body,
+# the torso link, and the heights of the end-effectors, the ankle roll and wrist yaw links. The observation and the
+# reward stay anchored at the pelvis.
 TERM_ANCHOR = "torso_link"
 TERM_END_EFFECTORS = ("left_ankle_roll_link", "right_ankle_roll_link", "left_wrist_yaw_link", "right_wrist_yaw_link")
 
 
 def body_termination(cfg: RewardCfg, tracked_bodies) -> RewardCfg:
-    """``cfg`` with BeyondMimic's termination: an episode ends when the height of TERM_ANCHOR or of one of
-    TERM_END_EFFECTORS differs from the reference's by more than cfg.term_height, or the z component of TERM_ANCHOR's
-    projected gravity by more than cfg.term_tilt. ``tracked_bodies``: the robot's tracked body names, which must hold
-    these bodies."""
+    """``cfg`` with the termination of BeyondMimic's released code: an episode ends when the height of TERM_ANCHOR or of
+    one of TERM_END_EFFECTORS differs from the reference's by more than cfg.term_height, or the z component of
+    TERM_ANCHOR's projected gravity by more than cfg.term_tilt. ``tracked_bodies``: the robot's tracked body names,
+    which must hold these bodies."""
     names = (TERM_ANCHOR, *TERM_END_EFFECTORS)
     missing = [n for n in names if n not in tracked_bodies]
     if missing:
         raise ValueError(f"the bodies {missing} are not tracked")
-    idx = tuple(list(tracked_bodies).index(n) for n in names)
-    return dataclasses.replace(cfg, term_bodies=idx, term_tilt_body=idx[0])
+    return dataclasses.replace(cfg, term_bodies=tuple(list(tracked_bodies).index(n) for n in names))
 
 
 def flatten_state(S) -> torch.Tensor:
@@ -110,8 +109,6 @@ class MDP:
     def __init__(self, kin: Kinematics, motion: MotionLib, default_q: torch.Tensor, xi_dim: int,
                  sensing: SensingCfg = SensingCfg(), cfg: RewardCfg = RewardCfg()):  # fmt: skip
         self.kin, self.motion, self.cfg = kin, motion, cfg
-        if bool(cfg.term_bodies) != (cfg.term_tilt_body is not None):
-            raise ValueError("RewardCfg: term_bodies and term_tilt_body are given together")
         self.dt = motion.dt  # control period (s): the per-step reward is a rate times dt
         self.max_step_reward = (4 * 1.0 + 2 * 0.5) * self.dt  # every tracking term at 1, no penalty
         self.default_q = default_q
@@ -195,15 +192,16 @@ class MDP:
 
     def body_errors(self, S, f) -> tuple[torch.Tensor, torch.Tensor]:
         """With cfg.term_bodies, the errors the termination tests: the height errors (..., len(term_bodies)) of the
-        tracked bodies term_bodies and the tilt error (...) of term_tilt_body, the absolute difference between the z
+        tracked bodies term_bodies and the tilt error (...) of the first of them, the absolute difference between the z
         components of its projected gravity R^T (0, 0, -1) and the reference body's. Body poses of S by forward
-        kinematics, against the reference bodies of frame f in the world frame (BeyondMimic's reference re-anchored to
-        the robot keeps each reference body's height)."""
-        c = self.cfg
+        kinematics, against the reference bodies of frame f in the world frame (the reference that BeyondMimic's
+        released code re-anchors to the robot keeps each reference body's height)."""
         bp, bR = self.kin.forward(*S)[:2]
         rbp, rbR = self.motion.ref_bodies(f)[:2]
-        i, a = list(c.term_bodies), c.term_tilt_body
-        e_z = (rbp[..., i, 2] - bp[..., i, 2]).abs()
+        # one integer index per body: a list index becomes a host tensor copied to the device, which a CUDA graph
+        # cannot capture
+        e_z = torch.stack([(rbp[..., i, 2] - bp[..., i, 2]).abs() for i in self.cfg.term_bodies], -1)
+        a = self.cfg.term_bodies[0]
         e_tilt = (rbR[..., a, 2, 2] - bR[..., a, 2, 2]).abs()
         return e_z, e_tilt
 
