@@ -35,6 +35,12 @@ def randomized(eval_mode: bool):
     return scene, sim, r, xi[:, layout.slices["friction"]].squeeze(-1)
 
 
+def plane(m: mujoco.MjModel) -> int:
+    """The floor: the model's one plane geom."""
+    (g,) = [i for i in range(m.ngeom) if m.geom_type[i] == mujoco.mjtGeom.mjGEOM_PLANE]
+    return g
+
+
 def floor_contact_friction(scene: Scene, friction: torch.Tensor, geom: str) -> list[float]:
     """Sliding friction of MuJoCo's contacts between ``geom`` and the floor (the plane), with the robot at the model's
     initial pose lowered until the geom's centre is at the floor's height and the geoms' sliding friction set to
@@ -42,8 +48,7 @@ def floor_contact_friction(scene: Scene, friction: torch.Tensor, geom: str) -> l
     m = scene.compile()
     m.geom_friction[:, 0] = friction.numpy()
     d = mujoco.MjData(m)
-    g = m.geom(geom).id
-    (floor,) = [i for i in range(m.ngeom) if m.geom_type[i] == mujoco.mjtGeom.mjGEOM_PLANE]
+    g, floor = m.geom(geom).id, plane(m)
     mujoco.mj_kinematics(m, d)
     d.qpos[2] -= d.geom_xpos[g, 2]
     mujoco.mj_forward(m, d)
@@ -58,25 +63,23 @@ class TestGroundFriction(unittest.TestCase):
         cls.eval = randomized(eval_mode=True)
 
     def test_ground_geoms_are_the_floor_plane(self):
-        scene, sim, r, _ = self.train
-        m = sim.mj_model
-        planes = [g for g in range(m.ngeom) if m.geom_type[g] == mujoco.mjtGeom.mjGEOM_PLANE]
-        self.assertEqual(r.ground_geoms.tolist(), planes)
-        self.assertEqual(len(planes), 1)
-        self.assertFalse(set(planes) & set(r.friction_geoms.tolist()))
+        _, sim, r, _ = self.train
+        floor = plane(sim.mj_model)
+        self.assertEqual(r.ground_geoms.tolist(), [floor])
+        self.assertNotIn(floor, r.friction_geoms.tolist())
 
     def test_training_puts_the_floor_at_the_bottom_of_the_range(self):
         _, sim, r, drawn = self.train
         lo, hi = ROBOT.dr.friction_range
         fr = sim.model.geom_friction[..., 0]
-        self.assertTrue(torch.all(fr[:, r.ground_geoms] == lo))
+        self.assertTrue(torch.all(fr[:, plane(sim.mj_model)] == lo))
         self.assertTrue(torch.all((drawn >= lo) & (drawn <= hi)))
         torch.testing.assert_close(fr[:, r.friction_geoms], drawn[:, None].expand(N, len(r.friction_geoms)))
 
     def test_evaluation_puts_floor_and_robot_at_one(self):
         _, sim, r, drawn = self.eval
         fr = sim.model.geom_friction[..., 0]
-        self.assertTrue(torch.all(fr[:, r.ground_geoms] == 1.0))
+        self.assertTrue(torch.all(fr[:, plane(sim.mj_model)] == 1.0))
         self.assertTrue(torch.all(fr[:, r.friction_geoms] == 1.0))
         self.assertTrue(torch.all(drawn == 1.0))
 
