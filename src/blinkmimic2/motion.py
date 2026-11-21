@@ -1,4 +1,5 @@
-"""Reference motion library: retargeted clips resampled to 50 Hz, with FK of tracked bodies."""
+"""Reference motion library: retargeted clips resampled to one row per control period (0.02 s, 50 Hz, unless chosen
+otherwise), with FK of tracked bodies."""
 
 from __future__ import annotations
 
@@ -13,8 +14,15 @@ from .kinematics import Kinematics
 from .robot import MotionArrays, RobotSpec
 from .rotations import mat_to_6d, mm3, mv3, quat_slerp, quat_to_mat, so3_log, yaw_mat
 
-CONTROL_DT = 0.02
-BIN_FRAMES = 50  # 1 s bins for return-based reset sampling
+CONTROL_DT = 0.02  # default control period (s); a library holds one row per control period (MotionLib.dt)
+BIN_SECONDS = 1.0  # bins of return-based reset sampling: round(BIN_SECONDS / dt) rows (MotionLib.bin_frames)
+BONES_DT = 0.02  # row period of the packed BONES-SEED library (tools/prepare_bones.py)
+
+
+def run_control_dt(run_args: dict) -> float:
+    """The control period (s) a run of blinkmimic2.train trained at, from its arguments (args.json): control_period;
+    runs written before that argument existed trained at 0.02 s."""
+    return run_args["control_period"] if "control_period" in run_args else 0.02
 
 
 BONES_LIB = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "bones_seed", "lib_all.npz")
@@ -22,17 +30,19 @@ GOAL_Q_OFFSET = 15  # index of the joint positions q(f+1) in the goal vector (fi
 
 
 class MotionLib:
-    def __init__(self, files: list[str], kin: Kinematics, device: str, load_motion: Callable[[str], MotionArrays]):
+    def __init__(self, files: list[str], kin: Kinematics, device: str, load_motion: Callable[[str], MotionArrays],
+                 control_dt: float = CONTROL_DT):  # fmt: skip
+        self.dt = control_dt
         names = [os.path.splitext(os.path.basename(f))[0] for f in files]
         ps, qs, js = [], [], []
         for f in files:
             p, quat, j, src_fps = load_motion(f)
             p, quat, j = (torch.tensor(x, dtype=torch.float32) for x in (p, quat, j))
-            # resample to 50 Hz
+            # resample to one row per control period
             T_src = p.shape[0]
             dur = (T_src - 1) / src_fps
-            n = int(np.floor(dur / CONTROL_DT)) + 1
-            t = torch.arange(n, dtype=torch.float32) * CONTROL_DT * src_fps
+            n = int(np.floor(dur / self.dt)) + 1
+            t = torch.arange(n, dtype=torch.float32) * self.dt * src_fps
             i0 = torch.clamp(t.floor().long(), max=T_src - 2)
             a = (t - i0.float()).clamp(0, 1)
             p = p[i0] * (1 - a[:, None]) + p[i0 + 1] * a[:, None]
@@ -42,15 +52,21 @@ class MotionLib:
         self._build(names, ps, qs, js, kin, device)
 
     @classmethod
-    def from_clips(cls, names: list[str], ps, qs, js, kin: Kinematics, device: str) -> MotionLib:
-        """Clips already at 50 Hz: root position (T,3), root quaternion wxyz (T,4), joint positions (T,J)."""
+    def from_clips(cls, names: list[str], ps, qs, js, kin: Kinematics, device: str, control_dt: float = CONTROL_DT) -> MotionLib:
+        """Clips already at one row per ``control_dt``: root position (T,3), root quaternion wxyz (T,4), joint positions
+        (T,J)."""
         self = cls.__new__(cls)
+        self.dt = control_dt
         self._build(names, ps, qs, js, kin, device)
         return self
 
     @classmethod
-    def from_bones(cls, lib_path: str, list_path: str, kin: Kinematics, device: str) -> MotionLib:
-        """BONES-SEED clips named in ``list_path`` (one per line) from the packed 50 Hz library of tools/prepare_bones.py."""
+    def from_bones(cls, lib_path: str, list_path: str, kin: Kinematics, device: str, control_dt: float = CONTROL_DT) -> MotionLib:
+        """BONES-SEED clips named in ``list_path`` (one per line) from the packed library of tools/prepare_bones.py, whose
+        rows are BONES_DT apart; another control period raises (the packed library is not resampled)."""
+        if control_dt != BONES_DT:
+            raise ValueError(f"the packed BONES-SEED library has one row per {BONES_DT} s, not per {control_dt} s; "
+                             "train on motion files (--motion_dir), which are resampled to the control period")
         names = [s.strip() for s in open(list_path) if s.strip()]
         lib = _npz_mmap(lib_path)
         index = {n: i for i, n in enumerate(lib["names"].tolist())}
@@ -61,7 +77,7 @@ class MotionLib:
             s, e = int(starts[i]), int(starts[i]) + int(lengths[i])
             ps.append(torch.from_numpy(np.array(lib["p"][s:e]))), qs.append(torch.from_numpy(np.array(lib["q"][s:e])))
             js.append(torch.from_numpy(np.array(lib["j"][s:e])))
-        return cls.from_clips(names, ps, qs, js, kin, device)
+        return cls.from_clips(names, ps, qs, js, kin, device, control_dt)
 
     def _build(self, names: list[str], ps, qs, js, kin: Kinematics, device: str) -> None:
         self.device = device
@@ -72,13 +88,13 @@ class MotionLib:
         root_p, root_R, root_v, root_w, jq, jqd = [], [], [], [], [], []
         for p, quat, j in zip(ps, qs, js):
             R = quat_to_mat(quat)
-            v = _gradient(p, CONTROL_DT)
-            qd = _gradient(j, CONTROL_DT)
+            v = _gradient(p, self.dt)
+            qd = _gradient(j, self.dt)
             # angular velocity (world) by central differences of rotations
             w = torch.zeros_like(p)
-            w[1:-1] = so3_log(R[2:] @ R[:-2].transpose(-1, -2)) / (2 * CONTROL_DT)
-            w[0] = so3_log(R[1] @ R[0].T) / CONTROL_DT
-            w[-1] = so3_log(R[-1] @ R[-2].T) / CONTROL_DT
+            w[1:-1] = so3_log(R[2:] @ R[:-2].transpose(-1, -2)) / (2 * self.dt)
+            w[0] = so3_log(R[1] @ R[0].T) / self.dt
+            w[-1] = so3_log(R[-1] @ R[-2].T) / self.dt
             root_p.append(p), root_R.append(R), root_v.append(v), root_w.append(w), jq.append(j), jqd.append(qd)
         cat = lambda xs: torch.cat(xs).to(device)  # noqa: E731
         self.root_p, self.root_R, self.root_v, self.root_w = cat(root_p), cat(root_R), cat(root_v), cat(root_w)
@@ -97,7 +113,9 @@ class MotionLib:
         self.root_gz = self.root_R[:, 2, 2]  # -(projected gravity z) of the reference root: g_b = R^T (0,0,-1)
 
     def _index(self, lens: list[int], device: str) -> None:
-        """Clip ranges, per-frame clip id and the 1 s bins (vectorized; the same integers as per-clip loops)."""
+        """Clip ranges, per-frame clip id and the bins of about BIN_SECONDS (vectorized; the same integers as per-clip
+        loops)."""
+        self.bin_frames = bf = round(BIN_SECONDS / self.dt)
         L = torch.tensor(lens, dtype=torch.long)
         self.clip_len = L.to(device)
         self.clip_start = torch.cumsum(torch.cat((torch.zeros(1, dtype=torch.long), L[:-1])), 0).to(device)
@@ -105,48 +123,50 @@ class MotionLib:
         self.num_frames = int(L.sum())
         C = len(lens)
         self.clip_id = torch.repeat_interleave(torch.arange(C), L).to(device)
-        nb = (L + BIN_FRAMES - 1) // BIN_FRAMES
+        nb = (L + bf - 1) // bf
         bin_off = torch.cumsum(torch.cat((torch.zeros(1, dtype=torch.long), nb[:-1])), 0)
         bin_clip = torch.repeat_interleave(torch.arange(C), nb)
         self.bin_clip = bin_clip.to(device)
-        self.bin_start = (self.clip_start.cpu()[bin_clip] + (torch.arange(int(nb.sum())) - bin_off[bin_clip]) * BIN_FRAMES).to(device)
+        self.bin_start = (self.clip_start.cpu()[bin_clip] + (torch.arange(int(nb.sum())) - bin_off[bin_clip]) * bf).to(device)
         self.num_bins = int(nb.sum())
         cid = self.clip_id.cpu()
         local = torch.arange(self.num_frames) - self.clip_start.cpu()[cid]
-        self.frame_bin = (bin_off[cid] + local // BIN_FRAMES).to(device)
+        self.frame_bin = (bin_off[cid] + local // bf).to(device)
         self._set_bin_end()
 
     def _set_bin_end(self) -> None:
         """bin_end: exclusive end of each bin's episode starts (env.sample_frames draws in [bin_start, bin_end)); a
-        clip's last bin ends one frame before the clip end (keep >= 1 step), the others after BIN_FRAMES starts."""
+        clip's last bin ends one frame before the clip end (keep >= 1 step), the others after bin_frames starts."""
         last = torch.ones_like(self.bin_clip, dtype=torch.bool)
         last[:-1] = self.bin_clip[1:] != self.bin_clip[:-1]
         ce = self.clip_end[self.bin_clip]
-        self.bin_end = torch.where(last, ce, torch.minimum(self.bin_start + BIN_FRAMES, ce))
+        self.bin_end = torch.where(last, ce, torch.minimum(self.bin_start + self.bin_frames, ce))
         w = (self.bin_end - self.bin_start).clamp(min=0).float()  # episode starts per bin
         self.bin_w = w / w.sum()  # --alloc e: uniform over episode starts
 
-    def merge_tail_bins(self, min_starts: int = BIN_FRAMES // 2) -> int:
-        """A clip's last bin with fewer than ``min_starts``
+    def merge_tail_bins(self, min_starts: int | None = None) -> int:
+        """A clip's last bin with fewer than ``min_starts`` (default: half a bin, bin_frames // 2)
         episode starts is merged into the bin before it. Unmerged, a last bin can hold a single start (or none: the
         start is the clip's last frame), its episodes last 1-4 steps, the first step's action-rate penalty
         (a_prev = 0) extrapolated by the mean-reward bootstrap gives a very low G, and the return softmax sends a
         third of all resets there. Clips with a single bin are unchanged. Returns the number of merged bins."""
+        bf = self.bin_frames
+        min_starts = bf // 2 if min_starts is None else min_starts
         dev = self.clip_len.device
         L = self.clip_len.cpu()
-        nb = (L + BIN_FRAMES - 1) // BIN_FRAMES
-        tail = (L - 1) - (nb - 1) * BIN_FRAMES  # starts in the last bin: local frames (nb-1)*BIN_FRAMES .. L-2
+        nb = (L + bf - 1) // bf
+        tail = (L - 1) - (nb - 1) * bf  # starts in the last bin: local frames (nb-1)*bf .. L-2
         merge = (nb > 1) & (tail < min_starts)
         nb = nb - merge.long()
         C = len(L)
         bin_off = torch.cumsum(torch.cat((torch.zeros(1, dtype=torch.long), nb[:-1])), 0)
         bin_clip = torch.repeat_interleave(torch.arange(C), nb)
         self.bin_clip = bin_clip.to(dev)
-        self.bin_start = (self.clip_start.cpu()[bin_clip] + (torch.arange(int(nb.sum())) - bin_off[bin_clip]) * BIN_FRAMES).to(dev)
+        self.bin_start = (self.clip_start.cpu()[bin_clip] + (torch.arange(int(nb.sum())) - bin_off[bin_clip]) * bf).to(dev)
         self.num_bins = int(nb.sum())
         cid = self.clip_id.cpu()
         local = torch.arange(self.num_frames) - self.clip_start.cpu()[cid]
-        self.frame_bin = (bin_off[cid] + torch.minimum(local // BIN_FRAMES, nb[cid] - 1)).to(dev)
+        self.frame_bin = (bin_off[cid] + torch.minimum(local // bf, nb[cid] - 1)).to(dev)
         self._set_bin_end()
         return int(merge.sum())
 
@@ -161,19 +181,19 @@ class MotionLib:
 
     @staticmethod
     def load(robot: RobotSpec, kin: Kinematics, device: str, motion_dir: str | None = None, bones_list: str | None = None,
-             bones_lib: str | None = None, store: str = "full") -> MotionLib:
-        """The robot's clip directory (or ``motion_dir``), or the BONES-SEED clips named in ``bones_list``. ``store``:
-        "full" precomputes every per-frame quantity (MotionLib); "fp32" / "fp16" keep only root pose and joint positions
-        and compute the rest when indexed (CompactMotionLib)."""
+             bones_lib: str | None = None, store: str = "full", control_dt: float = CONTROL_DT) -> MotionLib:
+        """The robot's clip directory (or ``motion_dir``), or the BONES-SEED clips named in ``bones_list``, at one row
+        per ``control_dt``. ``store``: "full" precomputes every per-frame quantity (MotionLib); "fp32" / "fp16" keep
+        only root pose and joint positions and compute the rest when indexed (CompactMotionLib)."""
         cls = MotionLib if store == "full" else CompactMotionLib
         if store != "full":
             CompactMotionLib.STORE_DTYPE = {"fp32": torch.float32, "fp16": torch.float16}[store]
         if bones_list:
-            return cls.from_bones(bones_lib or BONES_LIB, bones_list, kin, device)
+            return cls.from_bones(bones_lib or BONES_LIB, bones_list, kin, device, control_dt)
         files = sorted(glob.glob(os.path.join(motion_dir or robot.motion_dir, robot.motion_glob)))
         if not files:
             raise FileNotFoundError(f"no {robot.motion_glob} files in {motion_dir or robot.motion_dir}")
-        return cls(files, kin, device, robot.load_motion)
+        return cls(files, kin, device, robot.load_motion, control_dt)
 
     def set_ref_contact(self, feet: list[int], margin: float = 0.015, vmax: float = 0.5, q: float = 0.05) -> None:
         """Speed-branch reference foot contact (num_frames, len(feet)): height below the clip's own floor (the
@@ -268,7 +288,7 @@ class CompactMotionLib(MotionLib):
         c = self.clip_id[f]
         fm = torch.maximum(f - 1, self.clip_start[c])
         fp = torch.minimum(f + 1, self.clip_end[c])
-        h = ((fp - fm).float() * CONTROL_DT).unsqueeze(-1)
+        h = ((fp - fm).float() * self.dt).unsqueeze(-1)
         v = (self._p[fp] - self._p[fm]) / h
         w = so3_log(self._R(fp) @ self._R(fm).transpose(-1, -2)) / h
         qd = (self._j[fp].float() - self._j[fm].float()) / h

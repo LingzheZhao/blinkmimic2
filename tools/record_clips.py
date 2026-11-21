@@ -27,8 +27,8 @@ import blinkmimic2.networks as networks
 from blinkmimic2.dr import XiLayout
 from blinkmimic2.env import TrackingSim, make_sim
 from blinkmimic2.kinematics import Kinematics
-from blinkmimic2.mdp import MAX_STEP_REWARD, MDP
-from blinkmimic2.motion import MotionLib
+from blinkmimic2.mdp import MDP
+from blinkmimic2.motion import MotionLib, run_control_dt
 from blinkmimic2.networks import Policy, policy_kwargs
 from blinkmimic2.robot import get_robot
 from blinkmimic2.rotations import mat_to_quat
@@ -45,7 +45,8 @@ clips = list(dict.fromkeys(args.clips))
 with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
     fh.write("\n".join(clips) + "\n")
     list_path = fh.name
-motion = MotionLib.load(robot, kin, dev, None, list_path, args.bones_lib or _run_args.get("bones_lib"), _run_args.get("motion_store", "full"))
+motion = MotionLib.load(robot, kin, dev, None, list_path, args.bones_lib or _run_args.get("bones_lib"), _run_args.get("motion_store", "full"),
+                        run_control_dt(_run_args))  # fmt: skip
 os.unlink(list_path)
 assert motion.names == clips
 mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
@@ -95,7 +96,7 @@ with torch.no_grad():
     snap(~env.done_eval)  # the terminating state (alive False)
 
 clip_len = motion.clip_len[clip_of]
-norm = (ret / ((clip_len - 1).float() * MAX_STEP_REWARD)).view(R, C).cpu().numpy()
+norm = (ret / ((clip_len - 1).float() * mdp.max_step_reward)).view(R, C).cpu().numpy()
 ff = fail_f.view(R, C).cpu().numpy()
 np.savez_compressed(args.out, names=np.array(clips), **{k: torch.stack(v).numpy() for k, v in traj.items()},
                     ref_root_p=motion.root_p.cpu().numpy(), ref_root_R=motion.root_R[torch.arange(motion.num_frames, device=dev)].cpu().numpy(),
@@ -107,5 +108,5 @@ for c, n in enumerate(clips):
     L = int(motion.clip_len[c])
     nf = int((ff[:, c] >= 0).sum())
     fr = sorted(set(ff[ff[:, c] >= 0, c].tolist()))
-    print(f"  {n:70s} len {L:5d} ({L * 0.02:5.1f}s)  return r0 {norm[0, c]:.4f}  failed in {nf}/{R} replicas"
+    print(f"  {n:70s} len {L:5d} ({L * motion.dt:5.1f}s)  return r0 {norm[0, c]:.4f}  failed in {nf}/{R} replicas"
           + (f" at frames {fr[:6]}" if nf else ""))
