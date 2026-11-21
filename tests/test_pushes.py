@@ -42,6 +42,7 @@ def stand_in(timer: torch.Tensor, seed: int = 0, dt: float = CONTROL_DT):
                               data=SimpleNamespace(joint_pos=qpos[:, 7:], joint_vel=qvel[:, 6:])),
         scene=SimpleNamespace(env_origins=torch.zeros(N, 3)))  # fmt: skip
     env.state = lambda: TrackingSim.state(env)
+    env._redraw_push_timer = lambda mask: TrackingSim._redraw_push_timer(env, mask)
     return env
 
 
@@ -103,6 +104,21 @@ class TestPush(unittest.TestCase):
         self.assertTrue(((env.push_timer >= INTERVAL[0]) & (env.push_timer <= INTERVAL[1])).all())
 
 
+class TestTimer(unittest.TestCase):
+    def test_the_redraw_takes_a_new_interval_in_the_masked_worlds_only(self):
+        # as reset and reset_masked call it for the worlds whose episode starts
+        timer = torch.tensor([-0.01, 0.5, 2.0, 0.0])
+        mask = torch.tensor([True, False, True, False])
+        env = stand_in(timer)
+        torch.manual_seed(5)
+        TrackingSim._redraw_push_timer(env, mask)
+        torch.manual_seed(5)
+        lo, hi = INTERVAL
+        want = lo + (hi - lo) * torch.rand(4)
+        self.assertTrue(torch.equal(env.push_timer[mask], want[mask]))
+        self.assertTrue(torch.equal(env.push_timer[~mask], timer[~mask]))
+
+
 class TestCommandLine(unittest.TestCase):
     def call(self, *extra):
         cmd = [sys.executable, "-m", "blinkmimic2.train", *extra]
@@ -113,8 +129,14 @@ class TestCommandLine(unittest.TestCase):
                            (("--push_velocity", *map(str, HALF)), "together"),
                            (("--push_interval_s", "3", "1", "--push_velocity", *map(str, HALF)), "0 < LO <= HI"),
                            (("--push_interval_s", "0", "1", "--push_velocity", *map(str, HALF)), "0 < LO <= HI"),
+                           (("--push_interval_s", "1", "inf", "--push_velocity", *map(str, HALF)), "0 < LO <= HI < inf"),
+                           (("--push_interval_s", "nan", "3", "--push_velocity", *map(str, HALF)), "0 < LO <= HI < inf"),
                            (("--push_interval_s", "1", "3", "--push_velocity", "0.5", "0.5", "-0.2", "0", "0", "0"),
-                            "must not be negative")):  # fmt: skip
+                            "finite and not negative"),
+                           (("--push_interval_s", "1", "3", "--push_velocity", "nan", "0.5", "0.2", "0", "0", "0"),
+                            "finite and not negative"),
+                           (("--push_interval_s", "1", "3", "--push_velocity", "0.5", "0.5", "0.2", "inf", "0", "0"),
+                            "finite and not negative")):  # fmt: skip
             r = self.call(*extra)
             self.assertEqual(r.returncode, 2, extra)
             self.assertIn(msg, r.stderr)
