@@ -44,10 +44,9 @@ The simulator is `TrackingSim(make_sim(robot), T, robot, motion, mdp, "cuda:0", 
   array of 128 x T contacts for the batch) and 500 constraint rows (`njmax`).
 - `randomize` is off (`DomainRandomizer` in [`dr.py`](src/blinkmimic2/dr.py) in evaluation mode). It writes a sliding
   friction of 1 to every robot geom, keeps the joint encoder offsets at zero and leaves the centre of mass of
-  `torso_link` at the model's own. It also writes 1 to the geoms of the world body, but the floor is not one of them:
-  mjlab's plane terrain puts the floor plane on a body of its own (`terrain`) and gives it no friction, so it keeps
-  MuJoCo's default sliding friction of 1. A contact takes the friction of the geom of higher priority (the feet's
-  capsules have priority 1), else the larger of the two, so every robot-floor contact has a sliding friction of 1. The
+  `torso_link` at the model's own. It also writes 1 to the floor, the geom of mjlab's terrain entity (a plane on a
+  body of its own, `terrain`). A contact takes the friction of the geom of higher priority (the feet's capsules have
+  priority 1), else the larger of the two, so every robot-floor contact has a sliding friction of 1. The
   observation has no noise and no delay, and the release's random pushes are off.
 - `reset_noise` is off: a trial's body is placed exactly at its row's reference state plus the scene's offsets.
 
