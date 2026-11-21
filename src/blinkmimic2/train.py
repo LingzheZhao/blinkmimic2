@@ -52,13 +52,12 @@ parser.add_argument("--control_period", type=float, default=0.02,
                          "do not")
 parser.add_argument("--termination", type=str, default="root", choices=["root", "torso_and_end_effectors"],
                     help="what ends an episode before its time limit. root: the root's (pelvis) height differs from the "
-                         "reference's by more than --termination_height, or the z component of its projected gravity by "
-                         "more than 0.8. torso_and_end_effectors (BeyondMimic's): the height of the torso link, of an ankle "
-                         "roll link or of a wrist yaw link differs from the reference's by more than --termination_height, "
-                         "or the z component of the torso link's projected gravity by more than 0.8. The same errors give "
-                         "the soft termination of imagined rollouts and the danger ratio of exams")
-parser.add_argument("--termination_height", type=float, default=0.25,
-                    help="height error (m) of a body --termination tests above which the episode ends")
+                         "reference's by more than 0.25 m, or the z component of its projected gravity by more than 0.8. "
+                         "torso_and_end_effectors (as BeyondMimic's released code): the height of the torso link, of an "
+                         "ankle roll link or of a wrist yaw link differs from the reference's by more than 0.25 m, or the z "
+                         "component of the torso link's projected gravity by more than 0.8. The same errors give the soft "
+                         "termination of imagined rollouts and the danger ratio of exams; tools/evaluate.py, "
+                         "tools/record_clips.py and tools/rollouts.py apply the root's")
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 # ---- learner (SuperMimic with the BlinkMimic changes) ----
 parser.add_argument("--num_envs", type=int, default=4096)
@@ -149,8 +148,6 @@ if args.push_interval_s is not None and not 0 < args.push_interval_s[0] <= args.
     parser.error("--push_interval_s LO HI needs 0 < LO <= HI < inf")
 if args.push_velocity is not None and not all(0 <= h < math.inf for h in args.push_velocity):
     parser.error("--push_velocity: the half-ranges must be finite and not negative")
-if not 0 < args.termination_height < math.inf:
-    parser.error("--termination_height: needs a finite height > 0 (m)")
 JOINT_OFFSET = None  # --joint_offset: pattern -> half-range, in the order given
 if args.joint_offset is not None:
     JOINT_OFFSET = {}
@@ -210,7 +207,7 @@ if JOINT_OFFSET is not None:
 if args.push_interval_s is not None:
     robot = dataclasses.replace(robot, dr=dataclasses.replace(robot.dr, push_interval_s=tuple(args.push_interval_s),
                                                               push_velocity=tuple(args.push_velocity)))  # fmt: skip
-REWARD_CFG = RewardCfg(term_height=args.termination_height)
+REWARD_CFG = RewardCfg()
 if args.termination == "torso_and_end_effectors":
     try:
         REWARD_CFG = body_termination(REWARD_CFG, robot.tracked_bodies)
