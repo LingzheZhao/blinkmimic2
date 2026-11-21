@@ -64,7 +64,7 @@ def stand_in_sim(N: int, noise: bool, dr: DomainRandCfg = DomainRandCfg()):
         scene=SimpleNamespace(reset=lambda ids: None, env_origins=z(N, 3)), robot=Recorder(),
         randomizer=SimpleNamespace(reset=lambda xi, ids: None), xi=None, f=z(N, dtype=torch.long),
         ep_step=z(N, dtype=torch.long), a_prev=z(N, ROBOT.num_joints), start_bin=z(N, dtype=torch.long),
-        ep_disc_ret=z(N), ep_ret=z(N), obs_fresh=z(N, dtype=torch.bool))  # fmt: skip
+        ep_disc_ret=z(N), ep_ret=z(N), obs_fresh=z(N, dtype=torch.bool), push_enabled=False)  # fmt: skip
 
 
 class TestPlacedState(unittest.TestCase):
