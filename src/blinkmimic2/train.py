@@ -45,6 +45,11 @@ parser.add_argument("--joint_offset", type=str, nargs="+", default=None, metavar
                     help="half-range (rad) of the per-episode default joint position offset of the joints whose names match "
                          "the regular expression PATTERN; a joint takes the last pattern it matches, a joint matching none "
                          "gets no offset (default: the robot's ranges, 0.01 on every joint of the G1)")
+parser.add_argument("--control_period", type=float, default=0.02,
+                    help="seconds per control (= motion.CONTROL_DT by default, 50 Hz), a whole number of 5 ms physics steps; "
+                         "the motion files are resampled to it and every duration counted in controls follows it (reset "
+                         "bins, episode cap, pushes); --horizon, --hist, --goal_frames, --gamma and the other step counts "
+                         "do not")
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 # ---- learner (SuperMimic with the BlinkMimic changes) ----
 parser.add_argument("--num_envs", type=int, default=4096)
@@ -156,10 +161,10 @@ import torch.nn as nn
 
 from blinkmimic2.buffer import ReplayBuffer
 from blinkmimic2.dr import XiLayout
-from blinkmimic2.env import PHYSICS_DT, TrackingSim, make_sim
+from blinkmimic2.env import PHYSICS_DT, TrackingSim, decimation, make_sim
 from blinkmimic2.kinematics import Kinematics
-from blinkmimic2.mdp import MAX_STEP_REWARD, MDP, inv_dim, unflatten_state
-from blinkmimic2.motion import CONTROL_DT, MotionLib
+from blinkmimic2.mdp import MDP, inv_dim, unflatten_state
+from blinkmimic2.motion import MotionLib
 import blinkmimic2.networks as networks
 import blinkmimic2.rotations as rotations
 from blinkmimic2.networks import Critic, Policy, WorldModel, policy_kwargs
@@ -168,6 +173,11 @@ from blinkmimic2.objective import actor_objective
 from blinkmimic2.mdp import flatten_state
 from blinkmimic2.robot import get_robot
 from blinkmimic2.sensing import ObsPipeline
+
+try:
+    decimation(args.control_period)
+except ValueError as e:
+    parser.error(f"--control_period: {e}")
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -188,7 +198,7 @@ json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent
 
 J = robot.num_joints
 kin = Kinematics(robot, dev)
-motion = MotionLib.load(robot, kin, dev, args.motion_dir, args.bones_list, args.bones_lib, args.motion_store)
+motion = MotionLib.load(robot, kin, dev, args.motion_dir, args.bones_list, args.bones_lib, args.motion_store, args.control_period)
 print(f"motion library: {motion.merge_tail_bins()} clip-end bins merged, {motion.num_bins} bins", flush=True)
 layout = XiLayout(robot, dev)
 normalize_xi = layout.normalize
@@ -203,7 +213,7 @@ networks.RunningNorm.no_sync = True
 rotations.ELEMENTWISE = True
 
 wm = WorldModel(J, layout.dim, use_prev_action=robot.has_action_delay, hidden=widths(args.wm_hidden),
-                contact_modes=False, structured=True, dt=CONTROL_DT).to(dev)  # fmt: skip
+                contact_modes=False, structured=True, dt=motion.dt).to(dev)  # fmt: skip
 pi = Policy(mdp.obs_dim, GOAL_DIM, J, hist=Hh, enc_hidden=widths(args.enc_hidden), dec_hidden=widths(args.dec_hidden),
             **policy_kwargs(vars(args), robot)).to(dev)
 N_EX = int(round(args.exam_frac * args.num_envs))  # --exam_frac: envs N - N_EX .. N - 1 run exam episodes
@@ -247,7 +257,7 @@ assert N_EX == 0 or (args.pi_ema > 0 and not pipe.stateful), "--exam_frac: needs
 assert not args.front_share or (N_EX > 0), \
     "--front_share needs --exam_frac"
 critic = Critic(CRITIC_IN).to(dev)
-VMAX = (MAX_STEP_REWARD + max(args.contact_reward, 0.0) * 2 * CONTROL_DT) / (1 - args.gamma)  # bound on the critic value (largest per-step reward over 1 - gamma)
+VMAX = (mdp.max_step_reward + max(args.contact_reward, 0.0) * 2 * motion.dt) / (1 - args.gamma)  # bound on the critic value (largest per-step reward over 1 - gamma)
 VCL = torch.zeros(4, device=dev)  # summed clamped fractions (GAE V, targets, actor bootstrap), count
 print(f"critic value bound V_max = {VMAX:.4g}", flush=True)
 GRAPH = True
@@ -338,8 +348,8 @@ def _imag_step_sensed(S, o_hist, a_prev, f, xi, xi_n, g, st):
     a = pi(o_hist, g)
     S1 = wm.step(S, a, a_prev, xi_n)
     f1 = f + 1
-    gyro, accel = pipe.imu_from_states(S, S1, CONTROL_DT) if robot.sensing.imu is not None else (None, None)
-    st = pipe.filter_update(st, S1[5], gyro, accel, xi, CONTROL_DT, noise=True, ctrl_rate=True)
+    gyro, accel = pipe.imu_from_states(S, S1, motion.dt) if robot.sensing.imu is not None else (None, None)
+    st = pipe.filter_update(st, S1[5], gyro, accel, xi, motion.dt, noise=True, ctrl_rate=True)
     o1, st = pipe.observe(st, pipe.raw_obs(st, S1, a, xi, f1), noise=True, delay=True)
     o_hist = torch.cat((o_hist[:, 1:], o1.unsqueeze(1)), 1)
     return S1, a, o_hist, f1, motion.goal(f1, K), st
@@ -628,7 +638,7 @@ def policy_update():
     set_requires_grad(wm, True)
     set_requires_grad(critic, True)
     v_loss = critic_fit()
-    return loss.detach(), v_loss.detach(), (r_sum / HZ / 0.1).mean(), gn.detach(), c.mean().detach()
+    return loss.detach(), v_loss.detach(), (r_sum / HZ / mdp.max_step_reward).mean(), gn.detach(), c.mean().detach()
 
 
 # ------------------------------------------------------------------------------------------------
@@ -964,7 +974,7 @@ def _collect_core():
     # the simulator wrapper rebinds these per step: copy them back into the static tensors the graph reads
     CG["f"].copy_(env.f), CG["ep_step"].copy_(env.ep_step), CG["a_prev"].copy_(env.a_prev)
     env.f, env.ep_step, env.a_prev = CG["f"], CG["ep_step"], CG["a_prev"]
-    core = {"done": out["done"], "term": out["term"], "f": out["f"], "r_mean": out["r"].mean() / 0.1}
+    core = {"done": out["done"], "term": out["term"], "f": out["f"], "r_mean": out["r"].mean() / mdp.max_step_reward}
     out = env.step_tail_masked(out)
     n = out["n_done"]
     nan = torch.full((), float("nan"), device=dev)

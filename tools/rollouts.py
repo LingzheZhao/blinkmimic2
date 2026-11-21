@@ -5,8 +5,9 @@
 
 The policy is loaded as tools/evaluate.py loads it (the EMA weights "pi" of ckpt_NNNNNN.pt) and acts closed-loop and
 deterministically in the evaluation-mode simulator (no randomization, no noise), one world per trial of the scene. The
-command (the reference row the policy tracks) advances one row per control and holds at its clip's last row. "The
-release" in this file is BlinkMimic 2 v1.0.0, the code this tool reads.
+command (the reference row the policy tracks) advances one row per control and holds at its clip's last row. The control
+period (--control_period) must be the one the run trained at (motion.run_control_dt). "The release" in this file is
+BlinkMimic 2 v1.0.0, the code this tool reads.
 """
 
 import argparse
@@ -23,10 +24,10 @@ from mujoco_warp._src.types import OverflowType  # not exported by the mujoco_wa
 import blinkmimic2.networks as networks
 import blinkmimic2.rotations as rotations
 from blinkmimic2.dr import XiLayout
-from blinkmimic2.env import DECIMATION, PHYSICS_DT, TrackingSim, make_sim
+from blinkmimic2.env import PHYSICS_DT, TrackingSim, make_sim
 from blinkmimic2.kinematics import Kinematics
 from blinkmimic2.mdp import MDP, flatten_state
-from blinkmimic2.motion import CONTROL_DT, MotionLib
+from blinkmimic2.motion import MotionLib, run_control_dt
 from blinkmimic2.networks import Policy, policy_kwargs
 from blinkmimic2.robot import get_robot
 from blinkmimic2.rotations import mat_to_quat
@@ -203,7 +204,10 @@ def main():
     parser.add_argument("--termination", required=True, choices=["recipe", "nonfinite"],
                         help="recipe: the training recipe's termination (MDP.termination) or a non-finite state ends a trial; "
                              "nonfinite: only a non-finite state")
-    parser.add_argument("--controls", type=int, required=True, help="controls per trial (50 per second)")
+    parser.add_argument("--controls", type=int, required=True, help="controls per trial (50 per second at 0.02 s)")
+    parser.add_argument("--control_period", type=float, default=0.02,
+                        help="seconds per control: the period the run trained at (args.json control_period; 0.02 for runs "
+                             "without it), else refused")
     parser.add_argument("--out", required=True, help="output directory; it must not exist")
     args = parser.parse_args()
     if args.controls < 1:
@@ -214,12 +218,14 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True  # as tools/evaluate.py
     rotations.ELEMENTWISE = True  # as train.py: the 3x3 products of the kinematics, observation and goal without TF32
     run = json.load(open(os.path.join(args.run_dir, "args.json")))
+    if args.control_period != run_control_dt(run):
+        parser.error(f"--control_period {args.control_period} s: the run trained at {run_control_dt(run)} s")
     ckpt = os.path.join(args.run_dir, f"ckpt_{args.ckpt:06d}.pt")
     ck = torch.load(ckpt, map_location="cpu", weights_only=False)
     robot = get_robot(run["robot"])
     kin = Kinematics(robot, dev)
     library = {k: run[k] for k in ("motion_dir", "bones_list", "bones_lib", "motion_store")}
-    motion = MotionLib.load(robot, kin, dev, *library.values())
+    motion = MotionLib.load(robot, kin, dev, *library.values(), args.control_period)
     scene = json.load(open(args.scene))
     trials = {k: v.to(dev) for k, v in read_scene(scene, motion.num_frames, robot.num_joints, args.controls).items()}
     os.makedirs(args.out)
@@ -242,11 +248,11 @@ def main():
         "library": library | {"clips": len(motion.names), "rows": motion.num_frames},
         "card": torch.cuda.get_device_name(0),
         "simulator": {"nconmax": robot.nconmax, "njmax": robot.njmax, "naconmax_pooled": int(env.sim.wp_data.naconmax),
-                      "solver": list(robot.solver), "physics_dt": PHYSICS_DT, "decimation": DECIMATION},
+                      "solver": list(robot.solver), "physics_dt": PHYSICS_DT, "decimation": env.decimation},
         "bodies": {"names": bodies, "pelvis": bodies.index("pelvis"), "torso_link": bodies.index("torso_link")},
         "settings": {"eval_mode": env.eval_mode, "randomize": env.randomize, "reset_noise": env.reset_noise,
                      "action_noise": 0.0, "goal_frames": a_["goal_frames"], "hist": a_["hist"], "amp": a_["amp"],
-                     "allow_tf32": True, "elementwise_rotations": True, "control_dt": CONTROL_DT,
+                     "allow_tf32": True, "elementwise_rotations": True, "control_dt": motion.dt,
                      "term_height": mdp.cfg.term_height, "term_tilt": mdp.cfg.term_tilt,
                      "reset_half_widths": {"position": robot.dr.reset_pos, "rotation": robot.dr.reset_rot,
                                            "velocity": robot.dr.reset_lin_vel + robot.dr.reset_ang_vel,
