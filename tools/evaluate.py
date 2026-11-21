@@ -50,7 +50,8 @@ _run_args = json.load(open(os.path.join(args.run_dir, "args.json"))) if os.path.
 if not _run_args:  # a downloaded policy file alone: the flags it was trained with are stored inside it
     _run_args = torch.load(sorted(glob.glob(os.path.join(args.run_dir, "ckpt_*.pt")))[0], map_location="cpu", weights_only=False)["args"]
 motion = MotionLib.load(robot, kin, dev, _run_args.get("motion_dir"), args.bones_list or _run_args.get("bones_list"),
-                         args.bones_lib or _run_args.get("bones_lib"), _run_args.get("motion_store", "full"), run_control_dt(_run_args))
+                         args.bones_lib or _run_args.get("bones_lib"), _run_args.get("motion_store", "full"),
+                         control_dt=run_control_dt(_run_args))
 mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
 C = len(motion.names)
 L = motion.clip_len.cpu()

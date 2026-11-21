@@ -11,7 +11,7 @@ import torch
 from blinkmimic2.dr import XiLayout
 from blinkmimic2.kinematics import Kinematics
 from blinkmimic2.mdp import MDP
-from blinkmimic2.motion import MotionLib
+from blinkmimic2.motion import CONTROL_DT, MotionLib
 from blinkmimic2.robot import get_robot
 
 ROBOT = get_robot("mjlab_g1")
@@ -38,6 +38,6 @@ def library(device: str = "cpu"):
     j = torch.tensor(ROBOT.default_joint_pos_list())
     spec = {"walk": (0.76, None, True), "low": (0.40, None, False), "tilted": (0.76, 0, False), "lying": (0.15, 1, False)}
     clips = [_clip(CLIPS[k], z, axis, j, walk) for k, (z, axis, walk) in spec.items()]
-    motion = MotionLib.from_clips(list(spec), *zip(*clips), kin, device)
+    motion = MotionLib.from_clips(list(spec), *zip(*clips), kin, device, CONTROL_DT)
     mdp = MDP(kin, motion, j.to(device), XiLayout(ROBOT, device).dim, ROBOT.sensing)
     return kin, motion, mdp

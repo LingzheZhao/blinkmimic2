@@ -2,10 +2,10 @@
 the tools that load a run follow. At the default 0.02 s every quantity keeps the release's value; at 0.04 s the
 durations in seconds stay the same.
 
-train.py builds the simulator and trains once its options are parsed, so only its refusal runs here; the simulator's
-physics steps per control and a training at another period need a GPU."""
+train.py builds the simulator and trains once its options are parsed, so only its refusals run here. The formulas the
+simulator takes its physics steps per control and episode cap from are tested; that TrackingSim uses them, and a
+training at another period, need a GPU."""
 
-import json
 import os
 import subprocess
 import sys
@@ -23,12 +23,13 @@ from blinkmimic2.env import EPISODE_S, PHYSICS_DT, decimation  # noqa: E402
 from blinkmimic2.kinematics import Kinematics  # noqa: E402
 from blinkmimic2.mdp import MDP  # noqa: E402
 from blinkmimic2.motion import CONTROL_DT, MotionLib, run_control_dt  # noqa: E402
+from blinkmimic2.networks import WorldModel  # noqa: E402
 
 KIN = Kinematics(ROBOT, "cpu")
 
 
 def library(d: str, control_dt: float, store: str = "full") -> MotionLib:
-    return MotionLib.load(ROBOT, KIN, "cpu", d, "", None, store, control_dt)
+    return MotionLib.load(ROBOT, KIN, "cpu", d, "", None, store, control_dt=control_dt)
 
 
 def mdp_of(motion: MotionLib) -> MDP:
@@ -40,18 +41,24 @@ class TestPeriod(unittest.TestCase):
         self.assertEqual(CONTROL_DT, 0.02)
         self.assertEqual(PHYSICS_DT, 0.02 / 4)  # the release's CONTROL_DT / DECIMATION
         self.assertEqual(decimation(CONTROL_DT), 4)
-        self.assertEqual(round(EPISODE_S / CONTROL_DT), 500)  # the release's max_episode_steps
+        self.assertEqual(round(EPISODE_S / CONTROL_DT), 500)  # TrackingSim's episode cap formula: the release's 500
         with tempfile.TemporaryDirectory() as d:
             write_clip(os.path.join(d, "walk.csv"), 91)
             motion = library(d, CONTROL_DT)
         self.assertEqual((motion.dt, motion.bin_frames), (0.02, 50))
         self.assertEqual(mdp_of(motion).max_step_reward, (4 * 1.0 + 2 * 0.5) * 0.02)  # the release's MAX_STEP_REWARD
 
-    def test_physics_steps_per_control(self):
+    def test_the_physics_steps_per_control_formula(self):
         self.assertEqual([decimation(t) for t in (0.005, 0.02, 0.035, 0.04)], [1, 4, 7, 8])
         for t in (0.0, 0.0123, 0.0225):
             with self.assertRaisesRegex(ValueError, "not a whole number of 0.005 s physics steps"):
                 decimation(t)
+
+    def test_the_world_model_s_drift_weight_follows_the_physics_steps(self):
+        # (n + 1) / (2 n) for n physics steps per control: the release's 0.625 at 0.02 s
+        for dt, w in ((0.02, 0.625), (0.04, 0.5625)):
+            wm = WorldModel(ROBOT.num_joints, 4, hidden=(8,), structured=True, dt=dt, substeps=decimation(dt))
+            self.assertEqual(wm.drift_w, w)
 
     def test_durations_in_seconds_stay_at_another_period(self):
         with tempfile.TemporaryDirectory() as d:
@@ -83,7 +90,13 @@ class TestPeriod(unittest.TestCase):
 
     def test_the_packed_library_is_not_resampled(self):
         with self.assertRaisesRegex(ValueError, "one row per 0.02 s, not per 0.04 s"):
-            MotionLib.load(ROBOT, KIN, "cpu", None, "keep.txt", "lib_all.npz", "full", 0.04)
+            MotionLib.load(ROBOT, KIN, "cpu", None, "keep.txt", "lib_all.npz", "full", control_dt=0.04)
+
+    def test_a_library_needs_its_period(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_clip(os.path.join(d, "walk.csv"), 91)
+            with self.assertRaises(TypeError):
+                MotionLib.load(ROBOT, KIN, "cpu", d, "")
 
     def test_a_run_s_period(self):
         self.assertEqual(run_control_dt({"control_period": 0.04, "robot": "mjlab_g1"}), 0.04)
@@ -98,18 +111,14 @@ class TestCommandLine(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("--control_period: the control period 0.0123 s is not a whole number", r.stderr)
 
-    def test_rollouts_refuse_a_period_other_than_the_run_s(self):
-        tools = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
-        for run, extra, trained in (({"control_period": 0.04}, (), 0.04), ({"control_period": 0.02}, ("--control_period", "0.04"), 0.02),
-                                    ({}, ("--control_period", "0.04"), 0.02)):  # fmt: skip
-            with tempfile.TemporaryDirectory() as d:
-                json.dump(run | {"robot": "mjlab_g1"}, open(os.path.join(d, "args.json"), "w"))
-                cmd = [sys.executable, os.path.join(tools, "rollouts.py"), "--run_dir", d, "--ckpt", "1", "--scene", "s.json",
-                       "--termination", "nonfinite", "--controls", "5", "--out", os.path.join(d, "out"), *extra]  # fmt: skip
-                r = subprocess.run(cmd, capture_output=True, text=True)
-                self.assertEqual(r.returncode, 2, run)
-                self.assertIn(f"the run trained at {trained} s", r.stderr)
-                self.assertFalse(os.path.exists(os.path.join(d, "out")))
+    def test_another_period_with_the_packed_library_is_refused_before_args_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = os.path.join(d, "run")
+            r = subprocess.run([sys.executable, "-m", "blinkmimic2.train", "--control_period", "0.04", "--log_dir", run],
+                               capture_output=True, text=True)  # fmt: skip
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("the packed BONES-SEED library has one row per 0.02 s", r.stderr)
+            self.assertFalse(os.path.exists(run))
 
 
 if __name__ == "__main__":

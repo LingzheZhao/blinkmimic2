@@ -132,7 +132,7 @@ from blinkmimic2.dr import XiLayout
 from blinkmimic2.env import PHYSICS_DT, TrackingSim, decimation, make_sim
 from blinkmimic2.kinematics import Kinematics
 from blinkmimic2.mdp import MDP, inv_dim, unflatten_state
-from blinkmimic2.motion import MotionLib
+from blinkmimic2.motion import BONES_DT, MotionLib
 import blinkmimic2.networks as networks
 import blinkmimic2.rotations as rotations
 from blinkmimic2.networks import Critic, Policy, WorldModel, policy_kwargs
@@ -146,6 +146,9 @@ try:
     decimation(args.control_period)
 except ValueError as e:
     parser.error(f"--control_period: {e}")
+if args.bones_list and args.control_period != BONES_DT:
+    parser.error(f"--control_period {args.control_period}: the packed BONES-SEED library has one row per {BONES_DT} s; "
+                 "train on motion files (--bones_list= --motion_dir DIR), which are resampled to the control period")
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -158,7 +161,7 @@ json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent
 robot = get_robot(args.robot)
 J = robot.num_joints
 kin = Kinematics(robot, dev)
-motion = MotionLib.load(robot, kin, dev, args.motion_dir, args.bones_list, args.bones_lib, args.motion_store, args.control_period)
+motion = MotionLib.load(robot, kin, dev, args.motion_dir, args.bones_list, args.bones_lib, args.motion_store, control_dt=args.control_period)
 print(f"motion library: {motion.merge_tail_bins()} clip-end bins merged, {motion.num_bins} bins", flush=True)
 layout = XiLayout(robot, dev)
 normalize_xi = layout.normalize
@@ -173,7 +176,7 @@ networks.RunningNorm.no_sync = True
 rotations.ELEMENTWISE = True
 
 wm = WorldModel(J, layout.dim, use_prev_action=robot.has_action_delay, hidden=widths(args.wm_hidden),
-                contact_modes=False, structured=True, dt=motion.dt).to(dev)  # fmt: skip
+                contact_modes=False, structured=True, dt=motion.dt, substeps=decimation(motion.dt)).to(dev)  # fmt: skip
 pi = Policy(mdp.obs_dim, GOAL_DIM, J, hist=Hh, enc_hidden=widths(args.enc_hidden), dec_hidden=widths(args.dec_hidden),
             **policy_kwargs(vars(args), robot)).to(dev)
 N_EX = int(round(args.exam_frac * args.num_envs))  # --exam_frac: envs N - N_EX .. N - 1 run exam episodes
