@@ -4,6 +4,7 @@ frontier practice, a deployment stream and a step size planned for the budget. T
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import os
@@ -33,6 +34,12 @@ parser.add_argument("--motion_dir", type=os.path.abspath, default=None,
 parser.add_argument("--motion_store", type=str, default="fp32", choices=["full", "fp32", "fp16"],
                     help="full: every per-frame quantity precomputed; fp32 / fp16: root pose and joints only, the rest computed when indexed")
 parser.add_argument("--robot", type=str, default="mjlab_g1", help="robot package under blinkmimic2/ (mjlab_g1: the G1 as mjlab ships it)")
+parser.add_argument("--push_interval_s", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                    help="random root velocity pushes during training: seconds between two pushes of a robot, drawn "
+                         "uniformly in [LO, HI]; with --push_velocity (default: no pushes)")
+parser.add_argument("--push_velocity", type=float, nargs=6, default=None, metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
+                    help="half-ranges of a push's uniform change of the world-frame root velocity: linear x, y, z (m/s), "
+                         "angular about x, y, z (rad/s); with --push_interval_s")
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 # ---- learner (SuperMimic with the BlinkMimic changes) ----
 parser.add_argument("--num_envs", type=int, default=4096)
@@ -117,6 +124,12 @@ parser.add_argument("--wstream_burn", type=int, default=300, help="stream advanc
 args = parser.parse_args()
 if args.motion_dir and args.bones_list:
     parser.error("--motion_dir is read only with an empty --bones_list (--bones_list=)")
+if (args.push_interval_s is None) != (args.push_velocity is None):
+    parser.error("give --push_interval_s and --push_velocity together")
+if args.push_interval_s is not None and not 0 < args.push_interval_s[0] <= args.push_interval_s[1]:
+    parser.error("--push_interval_s LO HI needs 0 < LO <= HI")
+if args.push_velocity is not None and min(args.push_velocity) < 0:
+    parser.error("--push_velocity: the half-ranges must not be negative")
 
 import torch
 import torch.nn as nn
@@ -146,6 +159,9 @@ os.makedirs(args.log_dir, exist_ok=True)
 json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
 
 robot = get_robot(args.robot)
+if args.push_interval_s is not None:
+    robot = dataclasses.replace(robot, dr=dataclasses.replace(robot.dr, push_interval_s=tuple(args.push_interval_s),
+                                                              push_velocity=tuple(args.push_velocity)))  # fmt: skip
 J = robot.num_joints
 kin = Kinematics(robot, dev)
 motion = MotionLib.load(robot, kin, dev, args.motion_dir, args.bones_list, args.bones_lib, args.motion_store)
@@ -989,7 +1005,7 @@ def collect(n_steps: int, stats: dict):
     return
 
 env.use_static_focus()
-assert not env.push_enabled and not pipe.stateful, "captured collection: no pushes, no sensing state"
+assert not pipe.stateful, "captured collection: no sensing state"
 buffer.use_device_ptr(device_size=True)
 # captured sampling reads the buffer size on the device, so the graphs are captured at once
 full = (lambda: True)
