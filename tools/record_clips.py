@@ -46,7 +46,7 @@ with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
     fh.write("\n".join(clips) + "\n")
     list_path = fh.name
 motion = MotionLib.load(robot, kin, dev, None, list_path, args.bones_lib or _run_args.get("bones_lib"), _run_args.get("motion_store", "full"),
-                        run_control_dt(_run_args))  # fmt: skip
+                        control_dt=run_control_dt(_run_args))  # fmt: skip
 os.unlink(list_path)
 assert motion.names == clips
 mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)

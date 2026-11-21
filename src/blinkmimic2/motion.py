@@ -14,7 +14,7 @@ from .kinematics import Kinematics
 from .robot import MotionArrays, RobotSpec
 from .rotations import mat_to_6d, mm3, mv3, quat_slerp, quat_to_mat, so3_log, yaw_mat
 
-CONTROL_DT = 0.02  # default control period (s); a library holds one row per control period (MotionLib.dt)
+CONTROL_DT = 0.02  # the release's control period (s), train.py's default; a library holds one row per control period (MotionLib.dt)
 BIN_SECONDS = 1.0  # bins of return-based reset sampling: round(BIN_SECONDS / dt) rows (MotionLib.bin_frames)
 BONES_DT = 0.02  # row period of the packed BONES-SEED library (tools/prepare_bones.py)
 
@@ -31,7 +31,7 @@ GOAL_Q_OFFSET = 15  # index of the joint positions q(f+1) in the goal vector (fi
 
 class MotionLib:
     def __init__(self, files: list[str], kin: Kinematics, device: str, load_motion: Callable[[str], MotionArrays],
-                 control_dt: float = CONTROL_DT):  # fmt: skip
+                 control_dt: float):  # fmt: skip
         self.dt = control_dt
         names = [os.path.splitext(os.path.basename(f))[0] for f in files]
         ps, qs, js = [], [], []
@@ -52,7 +52,7 @@ class MotionLib:
         self._build(names, ps, qs, js, kin, device)
 
     @classmethod
-    def from_clips(cls, names: list[str], ps, qs, js, kin: Kinematics, device: str, control_dt: float = CONTROL_DT) -> MotionLib:
+    def from_clips(cls, names: list[str], ps, qs, js, kin: Kinematics, device: str, control_dt: float) -> MotionLib:
         """Clips already at one row per ``control_dt``: root position (T,3), root quaternion wxyz (T,4), joint positions
         (T,J)."""
         self = cls.__new__(cls)
@@ -61,7 +61,7 @@ class MotionLib:
         return self
 
     @classmethod
-    def from_bones(cls, lib_path: str, list_path: str, kin: Kinematics, device: str, control_dt: float = CONTROL_DT) -> MotionLib:
+    def from_bones(cls, lib_path: str, list_path: str, kin: Kinematics, device: str, control_dt: float) -> MotionLib:
         """BONES-SEED clips named in ``list_path`` (one per line) from the packed library of tools/prepare_bones.py, whose
         rows are BONES_DT apart; another control period raises (the packed library is not resampled)."""
         if control_dt != BONES_DT:
@@ -175,13 +175,13 @@ class MotionLib:
         return self.body_p[f], self.body_R[f], self.body_v[f], self.body_w[f]
 
     @staticmethod
-    def from_dir(path: str, robot: RobotSpec, kin: Kinematics, device: str) -> MotionLib:
+    def from_dir(path: str, robot: RobotSpec, kin: Kinematics, device: str, control_dt: float) -> MotionLib:
         files = sorted(glob.glob(os.path.join(path, robot.motion_glob)))
-        return MotionLib(files, kin, device, robot.load_motion)
+        return MotionLib(files, kin, device, robot.load_motion, control_dt)
 
     @staticmethod
     def load(robot: RobotSpec, kin: Kinematics, device: str, motion_dir: str | None = None, bones_list: str | None = None,
-             bones_lib: str | None = None, store: str = "full", control_dt: float = CONTROL_DT) -> MotionLib:
+             bones_lib: str | None = None, store: str = "full", *, control_dt: float) -> MotionLib:
         """The robot's clip directory (or ``motion_dir``), or the BONES-SEED clips named in ``bones_list``, at one row
         per ``control_dt``. ``store``: "full" precomputes every per-frame quantity (MotionLib); "fp32" / "fp16" keep
         only root pose and joint positions and compute the rest when indexed (CompactMotionLib)."""

@@ -5,9 +5,9 @@
 
 The policy is loaded as tools/evaluate.py loads it (the EMA weights "pi" of ckpt_NNNNNN.pt) and acts closed-loop and
 deterministically in the evaluation-mode simulator (no randomization, no noise), one world per trial of the scene. The
-command (the reference row the policy tracks) advances one row per control and holds at its clip's last row. The control
-period (--control_period) must be the one the run trained at (motion.run_control_dt). "The release" in this file is
-BlinkMimic 2 v1.0.0, the code this tool reads.
+command (the reference row the policy tracks) advances one row per control and holds at its clip's last row. A control
+lasts the run's control period (motion.run_control_dt). "The release" in this file is BlinkMimic 2 v1.0.0, the code
+this tool reads.
 """
 
 import argparse
@@ -204,10 +204,8 @@ def main():
     parser.add_argument("--termination", required=True, choices=["recipe", "nonfinite"],
                         help="recipe: the training recipe's termination (MDP.termination) or a non-finite state ends a trial; "
                              "nonfinite: only a non-finite state")
-    parser.add_argument("--controls", type=int, required=True, help="controls per trial (50 per second at 0.02 s)")
-    parser.add_argument("--control_period", type=float, default=0.02,
-                        help="seconds per control: the period the run trained at (args.json control_period; 0.02 for runs "
-                             "without it), else refused")
+    parser.add_argument("--controls", type=int, required=True,
+                        help="controls per trial, each of the run's control period (50 per second at 0.02 s)")
     parser.add_argument("--out", required=True, help="output directory; it must not exist")
     args = parser.parse_args()
     if args.controls < 1:
@@ -218,14 +216,12 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True  # as tools/evaluate.py
     rotations.ELEMENTWISE = True  # as train.py: the 3x3 products of the kinematics, observation and goal without TF32
     run = json.load(open(os.path.join(args.run_dir, "args.json")))
-    if args.control_period != run_control_dt(run):
-        parser.error(f"--control_period {args.control_period} s: the run trained at {run_control_dt(run)} s")
     ckpt = os.path.join(args.run_dir, f"ckpt_{args.ckpt:06d}.pt")
     ck = torch.load(ckpt, map_location="cpu", weights_only=False)
     robot = get_robot(run["robot"])
     kin = Kinematics(robot, dev)
     library = {k: run[k] for k in ("motion_dir", "bones_list", "bones_lib", "motion_store")}
-    motion = MotionLib.load(robot, kin, dev, *library.values(), args.control_period)
+    motion = MotionLib.load(robot, kin, dev, *library.values(), control_dt=run_control_dt(run))
     scene = json.load(open(args.scene))
     trials = {k: v.to(dev) for k, v in read_scene(scene, motion.num_frames, robot.num_joints, args.controls).items()}
     os.makedirs(args.out)
