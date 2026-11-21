@@ -8,6 +8,7 @@ import dataclasses
 import json
 import math
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 import time
 
@@ -40,6 +41,10 @@ parser.add_argument("--push_interval_s", type=float, nargs=2, default=None, meta
 parser.add_argument("--push_velocity", type=float, nargs=6, default=None, metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
                     help="half-ranges of a push's uniform change of the world-frame root velocity: linear x, y, z (m/s), "
                          "angular about x, y, z (rad/s); with --push_interval_s")
+parser.add_argument("--joint_offset", type=str, nargs="+", default=None, metavar="PATTERN=HALF",
+                    help="half-range (rad) of the per-episode default joint position offset of the joints whose names match "
+                         "the regular expression PATTERN; a joint takes the last pattern it matches, a joint matching none "
+                         "gets no offset (default: the robot's ranges, 0.01 on every joint of the G1)")
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 # ---- learner (SuperMimic with the BlinkMimic changes) ----
 parser.add_argument("--num_envs", type=int, default=4096)
@@ -130,6 +135,20 @@ if args.push_interval_s is not None and not 0 < args.push_interval_s[0] <= args.
     parser.error("--push_interval_s LO HI needs 0 < LO <= HI")
 if args.push_velocity is not None and min(args.push_velocity) < 0:
     parser.error("--push_velocity: the half-ranges must not be negative")
+JOINT_OFFSET = None  # --joint_offset: pattern -> half-range, in the order given
+if args.joint_offset is not None:
+    JOINT_OFFSET = {}
+    for item in args.joint_offset:
+        pat, _, half = item.rpartition("=")
+        try:
+            re.compile(pat)
+            ok = bool(pat) and pat not in JOINT_OFFSET and 0 <= float(half) < math.inf
+        except (re.error, ValueError):
+            ok = False
+        if not ok:
+            parser.error(f"--joint_offset {item}: needs PATTERN=HALF, a regular expression not given before and a "
+                         "half-range >= 0 (rad)")
+        JOINT_OFFSET[pat] = float(half)
 
 import torch
 import torch.nn as nn
@@ -155,13 +174,18 @@ torch.backends.cudnn.allow_tf32 = True
 torch.manual_seed(args.seed)
 networks.AMP_DTYPE = torch.bfloat16 if args.amp == "bf16" else None
 dev = "cuda:0"
-os.makedirs(args.log_dir, exist_ok=True)
-json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
-
 robot = get_robot(args.robot)
+if JOINT_OFFSET is not None:
+    for pat in JOINT_OFFSET:
+        if not any(re.fullmatch(pat, n) for n in robot.joint_names):
+            parser.error(f"--joint_offset: {pat} matches no joint of {args.robot}")
+    robot = dataclasses.replace(robot, dr=dataclasses.replace(robot.dr, joint_offset=JOINT_OFFSET))
 if args.push_interval_s is not None:
     robot = dataclasses.replace(robot, dr=dataclasses.replace(robot.dr, push_interval_s=tuple(args.push_interval_s),
                                                               push_velocity=tuple(args.push_velocity)))  # fmt: skip
+os.makedirs(args.log_dir, exist_ok=True)
+json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
+
 J = robot.num_joints
 kin = Kinematics(robot, dev)
 motion = MotionLib.load(robot, kin, dev, args.motion_dir, args.bones_list, args.bones_lib, args.motion_store)
