@@ -234,8 +234,11 @@ class MDP:
         --imag_term_scale); with cfg.term_bodies, of every error ``termination`` tests."""
         if self.cfg.term_bodies:
             e_z, e_tilt = self.body_errors(S, f)
-            alive = ((1 - torch.sigmoid((e_z - scale * self.cfg.term_height) / tz)).prod(-1)
-                     * (1 - torch.sigmoid((e_tilt - scale * self.cfg.term_tilt) / tt)))  # fmt: skip
+            alive = 1 - torch.sigmoid((e_tilt - scale * self.cfg.term_tilt) / tt)
+            # a product of factors, not prod(): prod's backward tests for zeros on the host, which a CUDA graph cannot
+            # capture (as objective.actor_objective's loop_cumprod)
+            for k in range(e_z.shape[-1]):
+                alive = alive * (1 - torch.sigmoid((e_z[..., k] - scale * self.cfg.term_height) / tz))
             return 1 - alive
         p, R = S[0], S[1]
         rp, rR = self.motion.root_p[f], self.motion.root_R[f]
