@@ -126,10 +126,10 @@ if args.motion_dir and args.bones_list:
     parser.error("--motion_dir is read only with an empty --bones_list (--bones_list=)")
 if (args.push_interval_s is None) != (args.push_velocity is None):
     parser.error("give --push_interval_s and --push_velocity together")
-if args.push_interval_s is not None and not 0 < args.push_interval_s[0] <= args.push_interval_s[1]:
-    parser.error("--push_interval_s LO HI needs 0 < LO <= HI")
-if args.push_velocity is not None and min(args.push_velocity) < 0:
-    parser.error("--push_velocity: the half-ranges must not be negative")
+if args.push_interval_s is not None and not 0 < args.push_interval_s[0] <= args.push_interval_s[1] < math.inf:
+    parser.error("--push_interval_s LO HI needs 0 < LO <= HI < inf")
+if args.push_velocity is not None and not all(0 <= h < math.inf for h in args.push_velocity):
+    parser.error("--push_velocity: the half-ranges must be finite and not negative")
 
 import torch
 import torch.nn as nn
