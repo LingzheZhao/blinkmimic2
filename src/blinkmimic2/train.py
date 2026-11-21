@@ -43,8 +43,8 @@ parser.add_argument("--push_velocity", type=float, nargs=6, default=None, metava
                          "angular about x, y, z (rad/s); with --push_interval_s")
 parser.add_argument("--joint_offset", type=str, nargs="+", default=None, metavar="PATTERN=HALF",
                     help="half-range (rad) of the per-episode default joint position offset of the joints whose names match "
-                         "the regular expression PATTERN; a joint takes the last pattern it matches, a joint matching none "
-                         "gets no offset (default: the robot's ranges, 0.01 on every joint of the G1)")
+                         "the regular expression PATTERN; a joint takes the last pattern it matches, and every joint must "
+                         "match one ('.*=0' gives no offset) (default: the robot's ranges, 0.01 on every joint of the G1)")
 parser.add_argument("--control_period", type=float, default=0.02,
                     help="seconds per control (= motion.CONTROL_DT by default, 50 Hz), a whole number of 5 ms physics steps; "
                          "the motion files are resampled to it and every duration counted in controls follows it (reset "
@@ -189,6 +189,9 @@ if JOINT_OFFSET is not None:
     for pat in JOINT_OFFSET:
         if not any(re.fullmatch(pat, n) for n in robot.joint_names):
             parser.error(f"--joint_offset: {pat} matches no joint of {args.robot}")
+    unmatched = [n for n in robot.joint_names if not any(re.fullmatch(pat, n) for pat in JOINT_OFFSET)]
+    if unmatched:
+        parser.error(f"--joint_offset: the joints {unmatched} match no pattern (give '.*=0' first for no offset)")
     robot = dataclasses.replace(robot, dr=dataclasses.replace(robot.dr, joint_offset=JOINT_OFFSET))
 if args.push_interval_s is not None:
     robot = dataclasses.replace(robot, dr=dataclasses.replace(robot.dr, push_interval_s=tuple(args.push_interval_s),
