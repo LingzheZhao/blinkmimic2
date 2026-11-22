@@ -110,10 +110,10 @@ class SetAfterStep(StandIn):
         return self.state(), report
 
 
-def run(trials, controls, recipe=False, nonfinite_at=None, policy=None, env=None):
+def run(trials, controls, root=False, nonfinite_at=None, policy=None, env=None):
     env = env or StandIn(len(trials), nonfinite_at)
     tr = rollouts.read_scene({"trials": trials}, ROWS, J, controls)
-    return rollouts.roll_out(env, policy or RowPolicy(), 4, MDP_, tr, controls, recipe), env
+    return rollouts.roll_out(env, policy or RowPolicy(), 4, MDP_, tr, controls, root), env
 
 
 def uniforms(seed: int) -> dict:
@@ -215,8 +215,8 @@ class TestRollOut(unittest.TestCase):
     def test_command_row_advances_and_holds_at_the_clip_end(self):
         # each trial starts two rows before the last row of its own clip: walk, low and lying, in one batch
         lasts = [LOW - 1, TILTED - 1, ROWS - 1]
-        for recipe in (False, True):
-            rec, _ = run([trial(last - 2) for last in lasts], 5, recipe=recipe)
+        for root in (False, True):
+            rec, _ = run([trial(last - 2) for last in lasts], 5, root=root)
             for t, last in enumerate(lasts):
                 self.assertEqual(rec["command_row_before"][:, t].tolist(), [last - 2, last - 1, last, last, last])
                 self.assertEqual(rec["command_row_after"][:, t].tolist(), [last - 1, last, last, last, last])
@@ -227,19 +227,19 @@ class TestRollOut(unittest.TestCase):
     def test_terminations(self):
         # upright at the command; 0.36 m low (height term only); rolled 90 degrees (tilt term only); lying (both)
         scene = [trial(1), trial(1, LOW + 1), trial(1, TILTED + 1), trial(1, LYING + 1)]
-        nonfinite, _ = run(scene, 3, recipe=False)
-        recipe, _ = run(scene, 3, recipe=True)
+        nonfinite, _ = run(scene, 3, root=False)
+        on_root, _ = run(scene, 3, root=True)
         terms = [[False, False], [True, False], [False, True], [True, True]]
         self.assertEqual([[bool(nonfinite["termination_height"][0, t]), bool(nonfinite["termination_tilt"][0, t])]
                           for t in range(4)], terms)  # fmt: skip
         self.assertFalse(nonfinite["done"].any())
-        self.assertEqual(recipe["done"][0].tolist(), [False, True, True, True])
-        self.assertFalse(recipe["done"][1:].any())
-        self.assertTrue(recipe["available"][:, 0].all() and recipe["available"][0].all())
-        self.assertFalse(recipe["available"][1:, 1:].any())
+        self.assertEqual(on_root["done"][0].tolist(), [False, True, True, True])
+        self.assertFalse(on_root["done"][1:].any())
+        self.assertTrue(on_root["available"][:, 0].all() and on_root["available"][0].all())
+        self.assertFalse(on_root["available"][1:, 1:].any())
         # the record of the first control is the same under both terminations
         for k in ("state", "termination_height", "termination_tilt", "command_row_after"):
-            np.testing.assert_array_equal(recipe[k][0], nonfinite[k][0])
+            np.testing.assert_array_equal(on_root[k][0], nonfinite[k][0])
         # the two terms are the release's termination (MDP.termination) against the command row after the control
         S = unflatten_state(torch.from_numpy(nonfinite["state"]).reshape(-1, 13 + 2 * J))
         release = MDP_.termination(S, torch.from_numpy(nonfinite["command_row_after"]).long().flatten())
@@ -248,7 +248,7 @@ class TestRollOut(unittest.TestCase):
     def test_terminations_at_their_thresholds(self):
         # 0.24 and 0.26 m below the command root, 0.26 m above it, and up-axis cosines 0.79 and 0.81 below the command's
         below, tilted = [0.24, 0.26, -0.26, 0.0, 0.0], [0.0, 0.0, 0.0, 0.79, 0.81]
-        rec, _ = run([trial(1)] * 5, 1, recipe=True, env=SetAfterStep(below, tilted))
+        rec, _ = run([trial(1)] * 5, 1, root=True, env=SetAfterStep(below, tilted))
         self.assertEqual(rec["termination_height"][0].tolist(), [False, True, True, False, False])
         self.assertEqual(rec["termination_tilt"][0].tolist(), [False, False, False, False, True])
         self.assertEqual(rec["done"][0].tolist(), [False, True, True, False, True])
@@ -257,8 +257,8 @@ class TestRollOut(unittest.TestCase):
         self.assertEqual(release.tolist(), rec["done"][0].tolist())
 
     def test_a_nonfinite_state_ends_a_trial_under_both_terminations(self):
-        for recipe in (False, True):
-            rec, env = run([trial(0), trial(1), trial(2)], 6, recipe=recipe, nonfinite_at={1: 2})
+        for root in (False, True):
+            rec, env = run([trial(0), trial(1), trial(2)], 6, root=root, nonfinite_at={1: 2})
             self.assertEqual(rec["done"][:, 1].tolist(), [False, False, True, False, False, False])
             self.assertEqual(rec["nonfinite"][:, 1].tolist(), [False, False, True, False, False, False])
             self.assertEqual(rec["available"][:, 1].tolist(), [True, True, False, False, False, False])
@@ -279,8 +279,8 @@ class TestRollOut(unittest.TestCase):
 
     def test_an_ended_trial_leaves_the_others_unchanged(self):
         scene = [trial(0, uniforms=uniforms(6)), trial(1, LYING), trial(2, push={"control": 1, "velocity_xy": [0.3, 0.1]})]
-        rec, _ = run(scene, 5, recipe=True, nonfinite_at={1: 1})
-        alone, _ = run([scene[0], scene[2]], 5, recipe=True)
+        rec, _ = run(scene, 5, root=True, nonfinite_at={1: 1})
+        alone, _ = run([scene[0], scene[2]], 5, root=True)
         self.assertTrue(rec["done"][0, 1])
         for k, v in alone.items():
             np.testing.assert_array_equal(np.delete(rec[k], 1, axis=0 if k in PER_TRIAL else 1), v, err_msg=k)
@@ -297,7 +297,7 @@ class TestRollOut(unittest.TestCase):
         np.testing.assert_array_equal(pushed["state"][2:, 0, 9:13], still["state"][2:, 0, 9:13])
 
     def test_a_push_after_the_end_is_not_applied(self):
-        rec, _ = run([trial(1, LYING, push={"control": 2, "velocity_xy": [1.0, 0.0]})], 4, recipe=True)
+        rec, _ = run([trial(1, LYING, push={"control": 2, "velocity_xy": [1.0, 0.0]})], 4, root=True)
         self.assertTrue(rec["done"][0, 0])
         self.assertFalse(rec["push_applied"].any())
 
