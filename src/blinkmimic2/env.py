@@ -150,6 +150,7 @@ class TrackingSim:
         self.J = robot.num_joints
         self.spec = robot
         self.motion, self.mdp, self.gamma = motion, mdp, gamma
+        self.dt = CONTROL_DT
         self.eval_mode = eval_mode
         self.randomize = (not eval_mode) if randomize is None else randomize
         self.max_episode_steps = max_episode_steps if not eval_mode else 10**9
@@ -177,6 +178,7 @@ class TrackingSim:
         self.push_enabled = robot.dr.push_interval_s is not None and self.randomize
         if self.push_enabled:
             self.push_timer.uniform_(*robot.dr.push_interval_s)
+            self.push_half = torch.tensor(robot.dr.push_velocity, device=dev)  # (6,): x, y, z, roll, pitch, yaw
 
         # ---- episode bookkeeping ----
         self.f = torch.zeros(self.N, dtype=torch.long, device=dev)
@@ -226,7 +228,7 @@ class TrackingSim:
         starts) and their terminations after ``burn`` steps are counted per bin in det_fail; the other worlds' terminations
         go to bin_fail (training-condition failures, the nominations)."""
         dev, m = self.device, self.motion
-        assert not self.pipe.stateful and not self.push_enabled and not self.eval_mode, "detectors: reset_masked configuration"
+        assert not self.pipe.stateful and not self.push_enabled and not self.eval_mode, "detectors: no pushes, no sensing state"
         self.det = torch.arange(self.N, device=dev) < n_det
         self.det_nominal, self.det_burn, self.track_fail = nominal, burn, True
         self.det_q = m.bin_w.clone()
@@ -382,6 +384,10 @@ class TrackingSim:
         self.ep_disc_ret.index_fill_(0, env_ids, 0.0)
         self.ep_ret.index_fill_(0, env_ids, 0.0)
         self.randomizer.reset(self.xi, env_ids)  # after scene.reset, which would restore actuator defaults
+        if self.push_enabled:  # a new episode waits a full push interval
+            started = torch.zeros(self.N, dtype=torch.bool, device=self.device)
+            started[env_ids] = True
+            self._redraw_push_timer(started)
         self.obs_fresh.index_fill_(0, env_ids, True)
 
     def use_static_focus(self):
@@ -401,9 +407,9 @@ class TrackingSim:
         """reset() of the worlds where ``mask`` is true, as fixed-size masked updates of all worlds (no host-side ids, so
         it can be captured in a CUDA graph). Worlds outside the mask are left bitwise unchanged; the reset worlds get the
         same values as reset() would give them for the same frames and random draws (random draws are made for all
-        worlds, so the random stream differs from reset()). Only the configuration used here is supported: no pushes,
-        no sensing state, no per-episode mjlab randomization terms, no actuator delays, no audit."""
-        assert not self.eval_mode and self.audit is None and not self.pipe.stateful and not self.push_enabled
+        worlds, so the random stream differs from reset()). Only the configuration used here is supported: no sensing
+        state, no per-episode mjlab randomization terms, no actuator delays, no audit."""
+        assert not self.eval_mode and self.audit is None and not self.pipe.stateful
         assert not self.randomizer._terms and self.spec.dr.solref_geoms is None and self.spec.dr.com_mass_range is None
         N, dev, m, c = self.N, self.device, self.motion, self.spec.dr
         d = mask
@@ -468,6 +474,8 @@ class TrackingSim:
         self.ep_disc_ret.masked_fill_(d, 0.0)
         self.ep_ret.masked_fill_(d, 0.0)
         self.randomizer.reset_masked(self.xi, d)
+        if self.push_enabled:  # a new episode waits a full push interval
+            self._redraw_push_timer(d)
         if self.det_nominal:
             sl = self.layout.slices["joint_offset"]
             self.xi[:, sl] = torch.where(self.det.unsqueeze(-1), 0.0, self.xi[:, sl])
@@ -534,18 +542,31 @@ class TrackingSim:
         self.obs_fresh[:] = False
         return self._obs
 
+    def _redraw_push_timer(self, mask: torch.Tensor) -> None:
+        """Draw the push timer of the worlds where ``mask`` is true anew from push_interval_s (seconds), as a fixed-size
+        masked update of every world (capturable); the other worlds' timers are left bitwise unchanged."""
+        lo, hi = self.spec.dr.push_interval_s
+        self.push_timer.copy_(torch.where(mask, lo + (hi - lo) * torch.rand(self.N, device=self.device), self.push_timer))
+
     def _push(self, done: torch.Tensor) -> torch.Tensor:
-        """Root velocity kicks at random intervals (between steps, after s1 is recorded)."""
-        self.push_timer -= CONTROL_DT
+        """Root velocity kicks at random intervals (between steps, after s1 is recorded). In every world whose timer has
+        run out and whose episode goes on, a uniform draw within the half-ranges push_velocity is added to the world-frame
+        root linear and angular velocity, and the timer is drawn again from push_interval_s (as it is when an episode
+        starts, in reset and reset_masked). Fixed-size masked updates of all worlds (no host sync, so the step can be
+        captured in a CUDA graph); the other worlds are left bitwise unchanged. Returns the mask of the pushed worlds."""
+        self.push_timer -= self.dt  # the timer counts seconds
         due = (self.push_timer <= 0) & ~done
-        ids = due.nonzero(as_tuple=False).squeeze(-1)
-        if len(ids) > 0:
-            c = self.spec.dr
-            _, _, v, w, _, _ = self.state()
-            kick = torch.stack([torch.empty(len(ids), device=self.device).uniform_(-h, h) for h in c.push_velocity], -1)
-            vel = torch.cat((v[ids], w[ids]), -1) + kick
-            self.robot.write_root_link_velocity_to_sim(vel, env_ids=ids)
-            self.push_timer[ids] = torch.empty(len(ids), device=self.device).uniform_(*c.push_interval_s)
+        kick = (2 * torch.rand(self.N, 6, device=self.device) - 1) * self.push_half
+        self._redraw_push_timer(due)
+        # TrackingSim.state's world-frame velocities plus the kick, written as mjlab's write_root_link_velocity_to_sim
+        # writes them (angular velocity in the root frame of the free joint's quaternion)
+        idx = self.robot.indexing
+        qvel, va = self.sim.data.qvel, idx.free_joint_v_adr
+        quat = self.sim.data.qpos[:, idx.free_joint_q_adr][:, 3:7]
+        _, _, v, w, _, _ = self.state()
+        vel = torch.cat((v, w), -1) + kick
+        new = torch.cat((vel[:, :3], quat_apply_inverse(quat, vel[:, 3:])), -1)
+        qvel[:, va] = torch.where(due.unsqueeze(-1), new, qvel[:, va])
         return due
 
     # ------------------------------------------------------------------ step
@@ -558,8 +579,8 @@ class TrackingSim:
         return self.step_tail(out)
 
     def step_core(self, a: torch.Tensor) -> dict:
-        """The step up to the episode ends: no host synchronization (pushes aside), so it can be captured in a CUDA
-        graph (train.py --collect_graph). The simulator wrapper rebinds f, ep_step and a_prev."""
+        """The step up to the episode ends: no host synchronization, so it can be captured in a CUDA graph (train.py
+        --collect_graph). The simulator wrapper rebinds f, ep_step and a_prev."""
         if self.pipe.stateful and self._obs is None:
             self.observe()
         o, o_state = self._obs, self._obs_state
