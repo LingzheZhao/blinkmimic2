@@ -33,6 +33,14 @@ parser.add_argument("--motion_dir", type=os.path.abspath, default=None,
 parser.add_argument("--motion_store", type=str, default="fp32", choices=["full", "fp32", "fp16"],
                     help="full: every per-frame quantity precomputed; fp32 / fp16: root pose and joints only, the rest computed when indexed")
 parser.add_argument("--robot", type=str, default="mjlab_g1", help="robot package under blinkmimic2/ (mjlab_g1: the G1 as mjlab ships it)")
+parser.add_argument("--termination", type=str, default="root", choices=["root", "torso_and_end_effectors"],
+                    help="what ends an episode before its time limit. root: the root's (pelvis) height differs from the "
+                         "reference's by more than 0.25 m, or the z component of its projected gravity by more than 0.8. "
+                         "torso_and_end_effectors (as BeyondMimic's released code): the height of the torso link, of an "
+                         "ankle roll link or of a wrist yaw link differs from the reference's by more than 0.25 m, or the z "
+                         "component of the torso link's projected gravity by more than 0.8. The same errors give the soft "
+                         "termination of imagined rollouts and the danger ratio of exams; tools/evaluate.py, "
+                         "tools/record_clips.py and tools/rollouts.py apply the root's")
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 # ---- learner (SuperMimic with the BlinkMimic changes) ----
 parser.add_argument("--num_envs", type=int, default=4096)
@@ -126,7 +134,7 @@ from blinkmimic2.buffer import ReplayBuffer
 from blinkmimic2.dr import XiLayout
 from blinkmimic2.env import PHYSICS_DT, TrackingSim, make_sim
 from blinkmimic2.kinematics import Kinematics
-from blinkmimic2.mdp import MAX_STEP_REWARD, MDP, inv_dim, unflatten_state
+from blinkmimic2.mdp import MAX_STEP_REWARD, MDP, RewardCfg, body_termination, inv_dim, unflatten_state
 from blinkmimic2.motion import CONTROL_DT, MotionLib
 import blinkmimic2.networks as networks
 import blinkmimic2.rotations as rotations
@@ -142,17 +150,23 @@ torch.backends.cudnn.allow_tf32 = True
 torch.manual_seed(args.seed)
 networks.AMP_DTYPE = torch.bfloat16 if args.amp == "bf16" else None
 dev = "cuda:0"
+robot = get_robot(args.robot)
+REWARD_CFG = RewardCfg()
+if args.termination == "torso_and_end_effectors":
+    try:
+        REWARD_CFG = body_termination(REWARD_CFG, robot.tracked_bodies)
+    except ValueError as e:
+        parser.error(f"--termination torso_and_end_effectors: {e} by {args.robot}")
 os.makedirs(args.log_dir, exist_ok=True)
 json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
 
-robot = get_robot(args.robot)
 J = robot.num_joints
 kin = Kinematics(robot, dev)
 motion = MotionLib.load(robot, kin, dev, args.motion_dir, args.bones_list, args.bones_lib, args.motion_store)
 print(f"motion library: {motion.merge_tail_bins()} clip-end bins merged, {motion.num_bins} bins", flush=True)
 layout = XiLayout(robot, dev)
 normalize_xi = layout.normalize
-mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), layout.dim, robot.sensing)
+mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), layout.dim, robot.sensing, REWARD_CFG)
 pipe = ObsPipeline(robot, mdp, layout, dev, PHYSICS_DT)
 K, Hh, HZ = args.goal_frames, args.hist, args.horizon
 GOAL_DIM = motion.goal_dim(K)

@@ -6,6 +6,7 @@ velocity of the root link frame, joint positions and velocities. ``J`` is the nu
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 
 import torch
@@ -48,6 +49,28 @@ class RewardCfg:
     soft_limit_factor: float = 0.9
     term_height: float = 0.25
     term_tilt: float = 0.8
+    # tracked-body indices whose height errors end an episode, the first of which also ends it by its tilt error
+    # (MDP.termination); empty: the root's height and tilt
+    term_bodies: tuple[int, ...] = ()
+
+
+# The termination of BeyondMimic's released code on the G1 (body_termination): the height and tilt of its anchor body,
+# the torso link, and the heights of the end-effectors, the ankle roll and wrist yaw links. The observation and the
+# reward stay anchored at the pelvis.
+TERM_ANCHOR = "torso_link"
+TERM_END_EFFECTORS = ("left_ankle_roll_link", "right_ankle_roll_link", "left_wrist_yaw_link", "right_wrist_yaw_link")
+
+
+def body_termination(cfg: RewardCfg, tracked_bodies) -> RewardCfg:
+    """``cfg`` with the termination of BeyondMimic's released code: an episode ends when the height of TERM_ANCHOR or of
+    one of TERM_END_EFFECTORS differs from the reference's by more than cfg.term_height, or the z component of
+    TERM_ANCHOR's projected gravity by more than cfg.term_tilt. ``tracked_bodies``: the robot's tracked body names,
+    which must hold these bodies."""
+    names = (TERM_ANCHOR, *TERM_END_EFFECTORS)
+    missing = [n for n in names if n not in tracked_bodies]
+    if missing:
+        raise ValueError(f"the bodies {missing} are not tracked")
+    return dataclasses.replace(cfg, term_bodies=tuple(list(tracked_bodies).index(n) for n in names))
 
 
 def flatten_state(S) -> torch.Tensor:
@@ -166,7 +189,25 @@ class MDP:
             }
         return r
 
+    def body_errors(self, S, f) -> tuple[torch.Tensor, torch.Tensor]:
+        """With cfg.term_bodies, the errors the termination tests: the height errors (..., len(term_bodies)) of the
+        tracked bodies term_bodies and the tilt error (...) of the first of them, the absolute difference between the z
+        components of its projected gravity R^T (0, 0, -1) and the reference body's. Body poses of S by forward
+        kinematics, against the reference bodies of frame f in the world frame (the reference that BeyondMimic's
+        released code re-anchors to the robot keeps each reference body's height)."""
+        bp, bR = self.kin.forward(*S)[:2]
+        rbp, rbR = self.motion.ref_bodies(f)[:2]
+        # one integer index per body: a list index becomes a host tensor copied to the device, which a CUDA graph
+        # cannot capture
+        e_z = torch.stack([(rbp[..., i, 2] - bp[..., i, 2]).abs() for i in self.cfg.term_bodies], -1)
+        a = self.cfg.term_bodies[0]
+        e_tilt = (rbR[..., a, 2, 2] - bR[..., a, 2, 2]).abs()
+        return e_z, e_tilt
+
     def termination(self, S, f) -> torch.Tensor:
+        if self.cfg.term_bodies:
+            e_z, e_tilt = self.body_errors(S, f)
+            return (e_z > self.cfg.term_height).any(-1) | (e_tilt > self.cfg.term_tilt)
         p, R = S[0], S[1]
         rp, rR = self.motion.root_p[f], self.motion.root_R[f]
         e_z = (rp[..., 2] - p[..., 2]).abs()
@@ -176,6 +217,9 @@ class MDP:
     def danger(self, S, f) -> torch.Tensor:
         """Danger ratio max(e_z / term_height, e_tilt / term_tilt) of the errors that ``termination`` tests (>= 1:
         terminated)."""
+        if self.cfg.term_bodies:
+            e_z, e_tilt = self.body_errors(S, f)
+            return torch.maximum((e_z / self.cfg.term_height).amax(-1), e_tilt / self.cfg.term_tilt)
         p, R = S[0], S[1]
         rp, rR = self.motion.root_p[f], self.motion.root_R[f]
         e_z = (rp[..., 2] - p[..., 2]).abs()
@@ -184,7 +228,15 @@ class MDP:
 
     def soft_termination(self, S, f, tz: float = 0.02, tt: float = 0.04, scale: float = 1.0) -> torch.Tensor:
         """Differentiable termination probability for imagined rollouts; ``scale`` < 1 tightens both thresholds (train.py
-        --imag_term_scale)."""
+        --imag_term_scale); with cfg.term_bodies, of every error ``termination`` tests."""
+        if self.cfg.term_bodies:
+            e_z, e_tilt = self.body_errors(S, f)
+            alive = 1 - torch.sigmoid((e_tilt - scale * self.cfg.term_tilt) / tt)
+            # a product of factors, not prod(): prod's backward tests for zeros on the host, which a CUDA graph cannot
+            # capture (as objective.actor_objective's loop_cumprod)
+            for k in range(e_z.shape[-1]):
+                alive = alive * (1 - torch.sigmoid((e_z[..., k] - scale * self.cfg.term_height) / tz))
+            return 1 - alive
         p, R = S[0], S[1]
         rp, rR = self.motion.root_p[f], self.motion.root_R[f]
         e_z = (rp[..., 2] - p[..., 2]).abs()

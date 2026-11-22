@@ -83,7 +83,7 @@ def read_scene(scene, num_rows: int, num_joints: int, controls: int) -> dict:
 
 
 @torch.no_grad()
-def roll_out(env, policy, goal_frames: int, mdp: MDP, trials: dict, controls: int, recipe: bool) -> dict:
+def roll_out(env, policy, goal_frames: int, mdp: MDP, trials: dict, controls: int, root: bool) -> dict:
     """Run the trials (read_scene, on the device of ``env``) closed-loop for ``controls`` controls and return the record
     of ROLLOUTS.md as numpy arrays.
 
@@ -91,9 +91,10 @@ def roll_out(env, policy, goal_frames: int, mdp: MDP, trials: dict, controls: in
     the state tuple (MDP) of every world, observe(command_row) the observation, push(ids, velocity_xy) adds planar world
     velocities to roots, and step(action, command_row) runs one control and returns the state after it and a report of
     [T] tensors: contacts, constraint_rows, contacts_beyond_capacity, rows_beyond_capacity. ``policy(history, goal)``
-    gives the actions, with ``policy.hist`` observations in the history. ``recipe``: the training recipe's termination
-    ends a trial; otherwise only a non-finite state does. A trial that has ended is placed again at its start before every
-    later control, with zero actions, so that it stays finite; its records are NaN, -1 or false."""
+    gives the actions, with ``policy.hist`` observations in the history. ``root``: the release's termination on the root
+    (MDP.termination of the default RewardCfg, whatever termination the run trained with) ends a trial; otherwise only a
+    non-finite state does. A trial that has ended is placed again at its start before every later control, with zero
+    actions, so that it stays finite; its records are NaN, -1 or false."""
     m, kin, cfg = mdp.motion, mdp.kin, mdp.cfg
     row = trials["command_row"].clone()
     T = len(row)
@@ -124,7 +125,7 @@ def roll_out(env, policy, goal_frames: int, mdp: MDP, trials: dict, controls: in
         # the release's termination (MDP.termination) against the command row after the control, term by term
         height = (m.root_p[after][:, 2] - S1[0][:, 2]).abs() > cfg.term_height
         tilt = (m.root_R[after][:, 2, 2] - S1[1][:, 2, 2]).abs() > cfg.term_tilt
-        done = running & ((nonfinite | height | tilt) if recipe else nonfinite)
+        done = running & ((nonfinite | height | tilt) if root else nonfinite)
         ok = running & ~nonfinite
         bp, bR = kin.forward(*S1)[:2]
         cbp, cbR = m.ref_bodies(after)[:2]
@@ -200,8 +201,9 @@ def main():
     parser.add_argument("--run_dir", required=True, help="run directory of blinkmimic2.train (args.json, ckpt_NNNNNN.pt)")
     parser.add_argument("--ckpt", type=int, required=True, help="iteration N of the checkpoint ckpt_NNNNNN.pt")
     parser.add_argument("--scene", required=True, help="scene file (JSON, ROLLOUTS.md)")
-    parser.add_argument("--termination", required=True, choices=["recipe", "nonfinite"],
-                        help="recipe: the training recipe's termination (MDP.termination) or a non-finite state ends a trial; "
+    parser.add_argument("--termination", required=True, choices=["root", "nonfinite"],
+                        help="root: the release's termination on the root (MDP.termination of the default "
+                             "RewardCfg, whatever train.py --termination the run used) or a non-finite state ends a trial; "
                              "nonfinite: only a non-finite state")
     parser.add_argument("--controls", type=int, required=True, help="controls per trial (50 per second)")
     parser.add_argument("--out", required=True, help="output directory; it must not exist")
@@ -254,7 +256,7 @@ def main():
                      "versions": {p: importlib.metadata.version(p) for p in ("torch", "warp-lang", "mujoco-warp", "mjlab")}},
     }  # fmt: skip
     json.dump(description, open(os.path.join(args.out, "description.json"), "w"), indent=1)
-    rec = roll_out(Simulator(env), pi, a_["goal_frames"], mdp, trials, args.controls, args.termination == "recipe")
+    rec = roll_out(Simulator(env), pi, a_["goal_frames"], mdp, trials, args.controls, args.termination == "root")
     np.savez_compressed(os.path.join(args.out, "rollouts.npz"), **rec)
     print(f"{len(rec['command_row'])} trials x {args.controls} controls: {int(rec['done'].sum())} ended; wrote {args.out}")
 
