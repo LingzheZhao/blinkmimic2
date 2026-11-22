@@ -18,8 +18,8 @@ from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
 
 from .dr import DomainRandCfg, DomainRandomizer, XiLayout
-from .mdp import MAX_STEP_REWARD, MDP, flatten_state
-from .motion import CONTROL_DT, MotionLib
+from .mdp import MDP, flatten_state
+from .motion import MotionLib
 from .robot import RobotSpec
 from .rotations import mat_to_quat, quat_to_mat, so3_exp
 from .sensing import ObsPipeline
@@ -55,8 +55,16 @@ def _sim_reset(self, env_ids=None) -> None:  # mjlab Simulation.reset without ho
 
 EntityData.clear_state, Simulation.reset = _clear_state, _sim_reset
 
-DECIMATION = 4  # 4 physics substeps of 5 ms per 50 Hz control step
-PHYSICS_DT = CONTROL_DT / DECIMATION
+PHYSICS_DT = 0.005  # MuJoCo time step (s); a control period is a whole number of physics steps
+EPISODE_S = 10.0  # cap of a training episode (s)
+
+
+def decimation(control_dt: float) -> int:
+    """Physics steps per control of period ``control_dt`` (s): control_dt / PHYSICS_DT, which must be a whole number."""
+    k = round(control_dt / PHYSICS_DT)
+    if k < 1 or abs(k * PHYSICS_DT - control_dt) > 1e-9:
+        raise ValueError(f"the control period {control_dt} s is not a whole number of {PHYSICS_DT} s physics steps")
+    return k
 
 
 def make_scene_cfg(robot: RobotSpec, num_envs: int) -> SceneCfg:
@@ -135,11 +143,12 @@ class TrackingSim:
     """Batched motion-tracking simulator for the robot of ``robot``."""
 
     def __init__(self, sim_cfg: SimulationCfg, num_envs: int, robot: RobotSpec, motion: MotionLib, mdp: MDP,
-                 device: str, gamma: float = 0.99, eval_mode: bool = False, max_episode_steps: int = 500,
+                 device: str, gamma: float = 0.99, eval_mode: bool = False, max_episode_steps: int | None = None,
                  reset_noise: bool = True, randomize: bool | None = None, fail_reset: float = 0.0, bin_fix: bool = False):  # fmt: skip
         """``randomize`` (default: not eval_mode) switches domain randomization, observation noise and
         delay, and pushes; ``eval_mode`` switches evaluation bookkeeping (no auto-reset, episode starts
-        exactly on the reference)."""
+        exactly on the reference). The control period is the motion library's row period (``motion.dt``), split into
+        physics steps of PHYSICS_DT; ``max_episode_steps`` defaults to EPISODE_S of controls."""
         self.device = device
         self.scene = Scene(make_scene_cfg(robot, num_envs), device=device)
         self.sim = Simulation(num_envs=num_envs, cfg=sim_cfg, model=self.scene.compile(), device=device)
@@ -150,8 +159,14 @@ class TrackingSim:
         self.J = robot.num_joints
         self.spec = robot
         self.motion, self.mdp, self.gamma = motion, mdp, gamma
+        if mdp.dt != motion.dt:
+            raise ValueError(f"the MDP's control period {mdp.dt} s differs from the motion library's {motion.dt} s")
+        self.dt = motion.dt
+        self.decimation = decimation(self.dt)
         self.eval_mode = eval_mode
         self.randomize = (not eval_mode) if randomize is None else randomize
+        if max_episode_steps is None:
+            max_episode_steps = round(EPISODE_S / self.dt)
         self.max_episode_steps = max_episode_steps if not eval_mode else 10**9
         self.reset_noise = reset_noise and not eval_mode
         dev = self.device
@@ -185,7 +200,7 @@ class TrackingSim:
         self.start_bin = torch.zeros(self.N, dtype=torch.long, device=dev)
         self.ep_disc_ret = torch.zeros(self.N, device=dev)
         self.ep_ret = torch.zeros(self.N, device=dev)
-        self.G_max = MAX_STEP_REWARD / (1 - gamma)
+        self.G_max = mdp.max_step_reward / (1 - gamma)
         self.bin_G = torch.full((motion.num_bins,), 0.0, device=dev)
         self.bin_w_avg = torch.full((motion.num_bins,), 1.0 / motion.num_bins, device=dev)
         # share of resets sent one bin before recent failure points (per-bin termination rate)
@@ -231,7 +246,7 @@ class TrackingSim:
         self.det_nominal, self.det_burn, self.track_fail = nominal, burn, True
         self.det_q = m.bin_w.clone()
         self.det_fail = torch.zeros(m.num_bins, device=dev)
-        self.det_visit = torch.zeros(m.num_bins, device=dev)  # detector steps per bin (/ BIN_FRAMES = passes)
+        self.det_visit = torch.zeros(m.num_bins, device=dev)  # detector steps per bin (/ motion.bin_frames = passes)
         self.det_ends = torch.zeros((), device=dev)  # detector episodes ended (any cause) since the last read
         if nominal and self.randomize:
             L, r, sim = self.layout, self.randomizer, self.sim
@@ -320,7 +335,7 @@ class TrackingSim:
             self._audit_reset(n, soft)
         bins = torch.multinomial(probs, n, replacement=True)
         start = m.bin_start[bins]
-        end = m.bin_end[bins]  # = min(start + 50, clip end) unless --bin_merge_tail; keeps >= 1 step before the clip end
+        end = m.bin_end[bins]  # = min(start + bin_frames, clip end) unless --bin_merge_tail; keeps >= 1 step before the clip end
         f = start + (torch.rand(n, device=self.device) * (end - start).float()).long()
         return f, bins
 
@@ -496,7 +511,7 @@ class TrackingSim:
             self.bin_fail.copy_(_bin_ema_w(bf, fb, term.float(), dw, 0.9))
         out["n_done"] = dw.sum()
         out["ep_len_sum"] = (T * dw).sum()
-        out["ep_ret_norm_sum"] = (self.ep_ret / (T * MAX_STEP_REWARD) * dw).sum()
+        out["ep_ret_norm_sum"] = (self.ep_ret / (T * self.mdp.max_step_reward) * dw).sum()
         self.reset_masked(done)
         return out
 
@@ -536,7 +551,7 @@ class TrackingSim:
 
     def _push(self, done: torch.Tensor) -> torch.Tensor:
         """Root velocity kicks at random intervals (between steps, after s1 is recorded)."""
-        self.push_timer -= CONTROL_DT
+        self.push_timer -= self.dt
         due = (self.push_timer <= 0) & ~done
         ids = due.nonzero(as_tuple=False).squeeze(-1)
         if len(ids) > 0:
@@ -571,7 +586,7 @@ class TrackingSim:
         ep_step = self.ep_step.clone()
         target = self.default_q + xi[:, 1 : 1 + self.J] + self.alpha * a
         self.robot.set_joint_position_target(target)
-        for _ in range(DECIMATION):
+        for _ in range(self.decimation):
             self.scene.write_data_to_sim()
             self.sim.step()
             self.scene.update(PHYSICS_DT)
@@ -629,7 +644,7 @@ class TrackingSim:
                 else:
                     self.bin_fail.index_put_((fb,), 0.9 * self.bin_fail[fb] + 0.1 * term[ids].float())
             out["ep_len"] = T
-            out["ep_ret_norm"] = self.ep_ret[ids] / (T * MAX_STEP_REWARD)
+            out["ep_ret_norm"] = self.ep_ret[ids] / (T * self.mdp.max_step_reward)
             self.reset(ids)
         if ids_ex is not None and len(ids_ex) > 0:
             self.reset(ids_ex, self.exam_frames(len(ids_ex)))

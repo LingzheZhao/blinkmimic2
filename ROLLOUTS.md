@@ -6,9 +6,10 @@ control. A trial can start from a body placed at any library row (a lying row of
 command starts at another row, from small explicit offsets of the reset, and can carry a push. "The release" below is
 BlinkMimic 2 v1.0.0, the code this fork starts from; the tool reads its environment, termination and reset as they are.
 
-A **control** is one 0.02 s policy step (50 Hz, four physics substeps of 5 ms); a **row** is one 0.02 s frame of the
-motion library. The **command** is the reference row the policy tracks: the policy's goal and observation read it,
-it advances one row per control and holds at its clip's last row.
+A **control** is one policy step of the run's control period (`control_period` in `args.json`; 0.02 s, 50 Hz, four
+physics substeps of 5 ms, for runs without it); a **row** is one frame of the motion library, one control period
+apart. The **command** is the reference row the policy tracks: the policy's goal and observation read it, it advances
+one row per control and holds at its clip's last row.
 
 ```bash
 python tools/rollouts.py --run_dir logs/run_s1 --ckpt 6500 --scene scene.json --termination nonfinite \
@@ -27,9 +28,9 @@ python tools/rollouts.py --run_dir logs/run_s1 --ckpt 6500 --scene scene.json --
 ## Requirements and refusals
 
 - One CUDA device (`cuda:0`).
-- `args.json` with the keys `robot`, `motion_dir`, `bones_list`, `bones_lib` and `motion_store`, which `train.py`
-  writes. The motion library is built from them as `tools/evaluate.py` builds it, so the scene's rows index the
-  run's library.
+- `args.json` with the keys `robot`, `motion_dir`, `bones_list`, `bones_lib` and `motion_store` (and `control_period`
+  when the run has one), which `train.py` writes. The motion library is built from them as `tools/evaluate.py` builds
+  it, so the scene's rows index the run's library.
 - A checkpoint with `pi`, `iteration` and `args` (`goal_frames`, `hist`, `enc_hidden`, `dec_hidden`, `amp`,
   `pi_ref_skip`).
 - A missing file or key raises. The scene is checked against the library before the output directory is made.

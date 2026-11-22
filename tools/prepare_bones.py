@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 
 SRC_FPS = 120.0
-DT = 0.02  # = motion.CONTROL_DT
+DT = 0.02  # = motion.BONES_DT
 FPS = 50
 
 SONIC_KEYWORDS = [

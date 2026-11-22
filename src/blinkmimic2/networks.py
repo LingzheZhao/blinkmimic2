@@ -81,11 +81,11 @@ class WorldModel(nn.Module):
     """
 
     def __init__(self, num_j: int, xi_dim: int, use_prev_action: bool = False, hidden=(2048, 2048, 2048),
-                 contact_modes: bool = False, structured: bool = False, dt: float = 0.02):  # fmt: skip
-        """``contact_modes``: the last layer predicts the two feet's next-step ground contact
-        and one increment head per contact mode (flight, left, right, double support); the increment is the
-        mixture of the heads weighted by the predicted mode probabilities, so each head stays smooth within
-        its mode instead of one MLP smoothing across touch-down and lift-off."""
+                 contact_modes: bool = False, structured: bool = False, *, dt: float, substeps: int):  # fmt: skip
+        """``dt``: the control period (s); ``substeps``: physics steps per control. ``contact_modes``: the last layer
+        predicts the two feet's next-step ground contact and one increment head per contact mode (flight, left, right,
+        double support); the increment is the mixture of the heads weighted by the predicted mode probabilities, so each
+        head stays smooth within its mode instead of one MLP smoothing across touch-down and lift-off."""
         super().__init__()
         self.num_j = num_j
         self.use_prev_action = use_prev_action
@@ -93,6 +93,10 @@ class WorldModel(nn.Module):
         # ``structured`` = semi-implicit integration (positions follow the predicted velocities,
         # the net predicts velocity increments plus small position corrections)
         self.structured, self.dt = structured, dt
+        # weight of the new velocity in the position drift: ``substeps`` semi-implicit physics steps per control with a
+        # linearly changing velocity give sum_k k/n / n = (n + 1) / (2 n); n = 4 substeps -> 0.625 (measured residual
+        # std of the joint-position increment: 16 % with 0.5, 11 % with 0.625, 17 % with 1.0)
+        self.drift_w = (substeps + 1) / (2 * substeps)
         self.in_dim = inv_dim(num_j) + num_j * (2 if use_prev_action else 1) + xi_dim
         self.out_dim = 3 + 3 + 3 + 3 + num_j + num_j
         n_out = 4 * self.out_dim + 2 if contact_modes else self.out_dim
@@ -110,17 +114,12 @@ class WorldModel(nn.Module):
             return torch.cat((invariant_features(S), a, a_prev, xi_n), -1)
         return torch.cat((invariant_features(S), a, xi_n), -1)
 
-    # weight of the new velocity in the position drift: n semi-implicit substeps with a linearly changing
-    # velocity give sum_k k/n / n = (n + 1) / (2 n); n = 4 substeps -> 0.625 (measured residual std of the
-    # joint-position increment: 16 % with 0.5, 11 % with 0.625, 17 % with 1.0)
-    DRIFT_W = 0.625
-
     def _drift(self, S, v1, w1, qd1):
         """Semi-implicit position update implied by the old and new velocities, in the frames of the
         increments: yaw frame for the root position, body frame for the rotation vector."""
         p, R, v, w, q, qd = S
         H = yaw_mat(R)
-        a, b = self.dt * (1 - self.DRIFT_W), self.dt * self.DRIFT_W
+        a, b = self.dt * (1 - self.drift_w), self.dt * self.drift_w
         return (mv3(H.transpose(-1, -2), a * v + b * v1), mv3(R.transpose(-1, -2), a * w + b * w1), a * qd + b * qd1)
 
     def targets(self, S, S1):

@@ -12,7 +12,7 @@ import unittest
 import numpy as np
 
 from blinkmimic2.kinematics import Kinematics
-from blinkmimic2.motion import MotionLib
+from blinkmimic2.motion import CONTROL_DT, MotionLib
 from blinkmimic2.robot import get_robot
 
 ROBOT = get_robot("mjlab_g1")
@@ -42,14 +42,15 @@ class TestMotionDir(unittest.TestCase):
                 # the keys train.py writes to args.json with --bones_list= --motion_dir D, passed as tools/evaluate.py
                 # passes them without its own --bones_list and --bones_lib
                 run = {"motion_dir": d, "bones_list": "", "bones_lib": "lib_all.npz", "motion_store": store}
-                motion = MotionLib.load(ROBOT, kin, "cpu", run["motion_dir"], run["bones_list"], run["bones_lib"], run["motion_store"])
+                motion = MotionLib.load(ROBOT, kin, "cpu", run["motion_dir"], run["bones_list"], run["bones_lib"], run["motion_store"],
+                                         control_dt=CONTROL_DT)  # fmt: skip
                 self.assertEqual(motion.names, ["a_walk", "b_run"])
                 # 50 Hz rows over (rows - 1) / 30 s: 0.5 s -> 26 rows, 1.0 s -> 51 rows
                 self.assertEqual(motion.clip_len.tolist(), [26, 51])
 
     def test_a_folder_without_motion_files_is_refused(self):
         with tempfile.TemporaryDirectory() as d, self.assertRaisesRegex(FileNotFoundError, "no \\*.csv files"):
-            MotionLib.load(ROBOT, Kinematics(ROBOT, "cpu"), "cpu", d, "")
+            MotionLib.load(ROBOT, Kinematics(ROBOT, "cpu"), "cpu", d, "", control_dt=CONTROL_DT)
 
 
 if __name__ == "__main__":

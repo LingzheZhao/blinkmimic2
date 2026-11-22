@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import torch
 
 from .kinematics import Kinematics
-from .motion import CONTROL_DT, MotionLib
+from .motion import MotionLib
 from .rotations import mat_to_6d, mm3, mv3, quat_to_mat, mat_to_quat, rot_angle_sq, yaw_mat
 from .sensing import SensingCfg, obs_noise
 
@@ -32,7 +32,6 @@ def obs_scale(J: int) -> torch.Tensor:
 
 
 CONTACT_Z = 0.045  # ankle-roll link origin height below which a foot counts as in contact
-MAX_STEP_REWARD = (4 * 1.0 + 2 * 0.5) * CONTROL_DT
 
 
 @dataclass
@@ -87,6 +86,8 @@ class MDP:
     def __init__(self, kin: Kinematics, motion: MotionLib, default_q: torch.Tensor, xi_dim: int,
                  sensing: SensingCfg = SensingCfg(), cfg: RewardCfg = RewardCfg()):  # fmt: skip
         self.kin, self.motion, self.cfg = kin, motion, cfg
+        self.dt = motion.dt  # control period (s): the per-step reward is a rate times dt
+        self.max_step_reward = (4 * 1.0 + 2 * 0.5) * self.dt  # every tracking term at 1, no penalty
         self.default_q = default_q
         mid, half = (kin.q_lo + kin.q_hi) / 2, (kin.q_hi - kin.q_lo) / 2
         self.soft_lo, self.soft_hi = mid - half * cfg.soft_limit_factor, mid + half * cfg.soft_limit_factor
@@ -146,7 +147,7 @@ class MDP:
         )
         r_rate = ((a - a_prev) ** 2).sum(-1)
         r_lim = (torch.relu(q - self.soft_hi) + torch.relu(self.soft_lo - q)).sum(-1)
-        r = (r_track + c.w_action_rate * r_rate + c.w_joint_limit * r_lim) * CONTROL_DT
+        r = (r_track + c.w_action_rate * r_rate + c.w_joint_limit * r_lim) * self.dt
         if w_contact > 0:
             fz, rz = bp[..., self.feet, 2], rbp[..., self.feet, 2]
             c_sim = torch.sigmoid((CONTACT_Z - fz) / 0.005)
@@ -154,10 +155,10 @@ class MDP:
             c_ref = rc[f] if rc is not None else (rz < CONTACT_Z).float()
             slip = (bv[..., self.feet, :2] ** 2).sum(-1)
             r_contact = (1 - (c_sim - c_ref) ** 2) + c_ref * torch.exp(-slip / 0.3**2)
-            r = r + w_contact * r_contact.mean(-1) * CONTROL_DT
+            r = r + w_contact * r_contact.mean(-1) * self.dt
         if terms:
             return r, {
-                "track": r_track * CONTROL_DT,
+                "track": r_track * self.dt,
                 "e_body_pos": e_pos,
                 "e_body_ori": e_ori,
                 "e_root_pos": e_rp,

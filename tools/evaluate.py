@@ -37,8 +37,8 @@ import blinkmimic2.networks as networks
 from blinkmimic2.dr import XiLayout
 from blinkmimic2.env import TrackingSim, make_sim
 from blinkmimic2.kinematics import Kinematics
-from blinkmimic2.mdp import MAX_STEP_REWARD, MDP
-from blinkmimic2.motion import MotionLib
+from blinkmimic2.mdp import MDP
+from blinkmimic2.motion import MotionLib, run_control_dt
 from blinkmimic2.networks import Policy, policy_kwargs
 from blinkmimic2.robot import get_robot
 
@@ -50,7 +50,8 @@ _run_args = json.load(open(os.path.join(args.run_dir, "args.json"))) if os.path.
 if not _run_args:  # a downloaded policy file alone: the flags it was trained with are stored inside it
     _run_args = torch.load(sorted(glob.glob(os.path.join(args.run_dir, "ckpt_*.pt")))[0], map_location="cpu", weights_only=False)["args"]
 motion = MotionLib.load(robot, kin, dev, _run_args.get("motion_dir"), args.bones_list or _run_args.get("bones_list"),
-                         args.bones_lib or _run_args.get("bones_lib"), _run_args.get("motion_store", "full"))
+                         args.bones_lib or _run_args.get("bones_lib"), _run_args.get("motion_store", "full"),
+                         control_dt=run_control_dt(_run_args))
 mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
 C = len(motion.names)
 L = motion.clip_len.cpu()
@@ -144,14 +145,14 @@ def evaluate_group(env: TrackingSim, cks: list[dict]) -> tuple[list[dict], int]:
         hist = torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
         if len(ids) > 0 and bool(ok.any()):  # a fresh episode starts with its first observation repeated
             hist[r_ids] = o[r_ids].unsqueeze(1).repeat(1, Hh, 1)
-    norm = ret_c / ((L.to(dev) - 1).float() * MAX_STEP_REWARD)
+    norm = ret_c / ((L.to(dev) - 1).float() * mdp.max_step_reward)
     res = []
     for m in range(M):
         failed = fail_c[m]
         fi = failed.nonzero().flatten().tolist()
         res.append({
             "norm_return": norm[m].mean().item(),
-            "norm_return_framew": (ret_c[m].sum() / ((L - 1).sum().item() * MAX_STEP_REWARD)).item(),
+            "norm_return_framew": (ret_c[m].sum() / ((L - 1).sum().item() * mdp.max_step_reward)).item(),
             "n_failed": len(fi),
             "failed": [motion.names[i] for i in fi],
             "fail_at": {motion.names[i]: [int(failf_c[m, i]), int(L[i])] for i in fi},
