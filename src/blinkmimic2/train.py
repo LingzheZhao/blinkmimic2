@@ -27,6 +27,9 @@ parser.add_argument("--ckpt_every", type=int, default=500, help="deployed (avera
 parser.add_argument("--log_every", type=int, default=100)
 parser.add_argument("--bones_lib", type=str, default=os.path.join(D, "lib_all.npz"), help="packed library (tools/prepare_bones.py)")
 parser.add_argument("--bones_list", type=str, default=os.path.join(D, "keep.txt"), help="clip names to train on, one per line")
+parser.add_argument("--motion_dir", type=os.path.abspath, default=None,
+                    help="folder of the robot's motion files, trained on with an empty --bones_list (--bones_list=); "
+                         "default: the robot's own motion folder")
 parser.add_argument("--motion_store", type=str, default="fp32", choices=["full", "fp32", "fp16"],
                     help="full: every per-frame quantity precomputed; fp32 / fp16: root pose and joints only, the rest computed when indexed")
 parser.add_argument("--robot", type=str, default="mjlab_g1", help="robot package under blinkmimic2/ (mjlab_g1: the G1 as mjlab ships it)")
@@ -112,6 +115,8 @@ parser.add_argument("--wstream_worlds", type=int, default=8192)
 parser.add_argument("--wstream_steps", type=int, default=2, help="stream steps per iteration")
 parser.add_argument("--wstream_burn", type=int, default=300, help="stream advances when it starts")
 args = parser.parse_args()
+if args.motion_dir and args.bones_list:
+    parser.error("--motion_dir is read only with an empty --bones_list (--bones_list=)")
 
 import torch
 import torch.nn as nn
@@ -143,7 +148,7 @@ json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent
 robot = get_robot(args.robot)
 J = robot.num_joints
 kin = Kinematics(robot, dev)
-motion = MotionLib.load(robot, kin, dev, None, args.bones_list, args.bones_lib, args.motion_store)
+motion = MotionLib.load(robot, kin, dev, args.motion_dir, args.bones_list, args.bones_lib, args.motion_store)
 print(f"motion library: {motion.merge_tail_bins()} clip-end bins merged, {motion.num_bins} bins", flush=True)
 layout = XiLayout(robot, dev)
 normalize_xi = layout.normalize

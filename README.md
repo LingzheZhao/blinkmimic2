@@ -357,3 +357,14 @@ Please also cite the works it builds on:
 
 MIT ([LICENSE](LICENSE)). Copyright (c) 2026 Jiayu Li; portions Copyright (c) 2026 Fuyi Chen (BlinkMimic), (c) 2026 Huy-Quang-Dao
 and (c) 2026 ETH Zurich, Chong Zhang. Data-derived files are excluded; see above.
+
+## Changes in this fork
+
+- [`train.py`](src/blinkmimic2/train.py) `--motion_dir DIR --bones_list=` trains on a folder of the robot's motion
+  files (for `mjlab_g1`, LAFAN1 G1 retarget CSVs), e.g. `bash scripts/train.sh logs/lafan1_s1 --motion_dir DIR
+  --bones_list=`; [`tools/evaluate.py`](tools/evaluate.py) reads the folder back from the run's `args.json`.
+- `TrackingSim.reset` can place the body at a library row other than the command row and with explicit unit offsets
+  of the reset noise ([`env.placed_state`](src/blinkmimic2/env.py)); without them it draws as before.
+- [`tools/rollouts.py`](tools/rollouts.py) rolls a checkpoint's policy out from placed starts and records every
+  control: [ROLLOUTS.md](ROLLOUTS.md).
+- [`tests/`](tests): unit tests that run on the CPU, `python -m unittest discover -s tests`.

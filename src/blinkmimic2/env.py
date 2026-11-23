@@ -17,7 +17,7 @@ from mjlab.scene import Scene, SceneCfg
 from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
 
-from .dr import DomainRandomizer, XiLayout
+from .dr import DomainRandCfg, DomainRandomizer, XiLayout
 from .mdp import MAX_STEP_REWARD, MDP, flatten_state
 from .motion import CONTROL_DT, MotionLib
 from .robot import RobotSpec
@@ -83,6 +83,37 @@ def make_sim(robot: RobotSpec) -> SimulationCfg:
             ccd_iterations=robot.solver[3],
         ),
     )
+
+
+def placed_state(ref, c: DomainRandCfg, noise: bool, uniforms: dict | None = None):
+    """The state a reset writes before the joint clamp: the reference state ``ref`` (MotionLib.ref_state of the placed
+    rows) plus the reset offsets of ``c``. With ``uniforms`` (``position`` [n, 3], ``rotation`` [n, 3], ``velocity``
+    [n, 6], ``joints`` [n, J], each in [-1, 1]) the offsets are these times the half-widths reset_pos, reset_rot,
+    reset_lin_vel and reset_ang_vel, reset_joint_pos, and nothing is drawn. Without them the offsets are drawn
+    uniformly when ``noise`` is true (position, rotation, linear and angular velocity, joints, then joint velocities if
+    reset_joint_vel > 0) and are zero otherwise. The rotation offset is a world-frame rotation vector premultiplied on the
+    root rotation; the velocity offsets are added to the world-frame root velocities."""
+    p, R, v, w, q, qd = ref
+    if uniforms is not None:
+        if c.reset_joint_vel > 0:
+            raise ValueError("unit uniforms hold no joint velocities, but reset_joint_vel > 0")
+        half = lambda h: torch.tensor(h, device=p.device)  # noqa: E731
+        dR = so3_exp(uniforms["rotation"] * half(c.reset_rot))
+        # elementwise product: zero uniforms leave R exact whatever the matmul precision (TF32)
+        return (p + uniforms["position"] * half(c.reset_pos), (dR.unsqueeze(-1) * R.unsqueeze(-3)).sum(-2),
+                v + uniforms["velocity"][:, :3] * half(c.reset_lin_vel), w + uniforms["velocity"][:, 3:] * half(c.reset_ang_vel),
+                q + uniforms["joints"] * c.reset_joint_pos, qd)  # fmt: skip
+    if noise:
+        n, dev = p.shape[0], p.device
+        u = lambda half: torch.stack([torch.empty(n, device=dev).uniform_(-h, h) for h in half], -1)  # noqa: E731
+        p = p + u(c.reset_pos)
+        R = so3_exp(u(c.reset_rot)) @ R
+        v = v + u(c.reset_lin_vel)
+        w = w + u(c.reset_ang_vel)
+        q = q + torch.empty_like(q).uniform_(-c.reset_joint_pos, c.reset_joint_pos)
+        if c.reset_joint_vel > 0:
+            qd = qd + torch.empty_like(qd).uniform_(-c.reset_joint_vel, c.reset_joint_vel)
+    return p, R, v, w, q, qd
 
 
 def _bin_ema_w(stat: torch.Tensor, bins: torch.Tensor, x: torch.Tensor, wt: torch.Tensor, old: float) -> torch.Tensor:
@@ -314,26 +345,21 @@ class TrackingSim:
         for k, v in parts.items():
             A.setdefault(k, torch.zeros_like(self.bin_G)).add_(n * v)
 
-    def reset(self, env_ids: torch.Tensor, frames: torch.Tensor | None = None):
+    def reset(self, env_ids: torch.Tensor, frames: torch.Tensor | None = None, uniforms: dict | None = None,
+              body_frames: torch.Tensor | None = None):  # fmt: skip
+        """Start episodes in the worlds ``env_ids``: the command (the reference row the world tracks, ``f``) starts at
+        ``frames`` (default: sampled) and the body is placed at the reference state of ``body_frames`` (default:
+        ``frames``) with the offsets of :func:`placed_state` (``uniforms``, else the reset noise)."""
         if len(env_ids) == 0:
             return
         n = len(env_ids)
-        dev = self.device
         if frames is None:
             frames, bins = self.sample_frames(n)
         else:
             bins = self.motion.frame_bin[frames]
-        m, c = self.motion, self.spec.dr
-        p, R, v, w, q, qd = (x.clone() for x in m.ref_state(frames))
-        if self.reset_noise:
-            u = lambda half: torch.stack([torch.empty(n, device=dev).uniform_(-h, h) for h in half], -1)  # noqa: E731
-            p = p + u(c.reset_pos)
-            R = so3_exp(u(c.reset_rot)) @ R
-            v = v + u(c.reset_lin_vel)
-            w = w + u(c.reset_ang_vel)
-            q = q + torch.empty_like(q).uniform_(-c.reset_joint_pos, c.reset_joint_pos)
-            if c.reset_joint_vel > 0:
-                qd = qd + torch.empty_like(qd).uniform_(-c.reset_joint_vel, c.reset_joint_vel)
+        m = self.motion
+        ref = tuple(x.clone() for x in m.ref_state(frames if body_frames is None else body_frames))
+        p, R, v, w, q, qd = placed_state(ref, self.spec.dr, self.reset_noise, uniforms)
         q = torch.clamp(q, self.mdp.kin.q_lo, self.mdp.kin.q_hi)
         # mjlab's reset clears solver warm-start data and actuator targets, so it runs before the writes
         self.sim.reset(env_ids)
@@ -400,21 +426,12 @@ class TrackingSim:
                 frames, bins = torch.cat((frames[: N - n], ef)), torch.cat((bins[: N - n], eb))
         else:
             bins = m.frame_bin[frames]
-        p, R, v, w, q, qd = (x.clone() for x in m.ref_state(frames))
-        if self.reset_noise:
-            clean = (p, R, v, w, q, qd)
-            u = lambda half: torch.stack([torch.empty(N, device=dev).uniform_(-h, h) for h in half], -1)  # noqa: E731
-            p = p + u(c.reset_pos)
-            R = so3_exp(u(c.reset_rot)) @ R
-            v = v + u(c.reset_lin_vel)
-            w = w + u(c.reset_ang_vel)
-            q = q + torch.empty_like(q).uniform_(-c.reset_joint_pos, c.reset_joint_pos)
-            if c.reset_joint_vel > 0:
-                qd = qd + torch.empty_like(qd).uniform_(-c.reset_joint_vel, c.reset_joint_vel)
-            if self.det_nominal:  # detectors start exactly on the reference, as the evaluation
-                dn = self.det.view(-1, *([1] * (R.dim() - 1)))
-                p, R, v, w, q, qd = (torch.where(dn if x.dim() == 3 else self.det.unsqueeze(-1), x0, x)
-                                     for x0, x in zip(clean, (p, R, v, w, q, qd)))  # fmt: skip
+        clean = tuple(x.clone() for x in m.ref_state(frames))
+        p, R, v, w, q, qd = placed_state(clean, c, self.reset_noise)
+        if self.reset_noise and self.det_nominal:  # detectors start exactly on the reference, as the evaluation
+            dn = self.det.view(-1, *([1] * (R.dim() - 1)))
+            p, R, v, w, q, qd = (torch.where(dn if x.dim() == 3 else self.det.unsqueeze(-1), x0, x)
+                                 for x0, x in zip(clean, (p, R, v, w, q, qd)))  # fmt: skip
         q = torch.clamp(q, self.mdp.kin.q_lo, self.mdp.kin.q_hi)
         # Simulation.reset (solver warm start, controls, ...) of the masked worlds, before the writes
         sim = self.sim
