@@ -14,6 +14,7 @@ import warp as wp
 from mjlab.entity.data import EntityData
 from mjlab.utils.lab_api.math import quat_apply_inverse
 from mjlab.scene import Scene, SceneCfg
+from mjlab.sensor import SensorCfg
 from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
 
@@ -67,17 +68,21 @@ def decimation(control_dt: float) -> int:
     return k
 
 
-def make_scene_cfg(robot: RobotSpec, num_envs: int) -> SceneCfg:
+def make_scene_cfg(robot: RobotSpec, num_envs: int, sensors: tuple[SensorCfg, ...] = ()) -> SceneCfg:
+    """The plane terrain (body "terrain"), the robot (entity "robot") and the mjlab sensors ``sensors``."""
     return SceneCfg(
         num_envs=num_envs,
         env_spacing=0.0,
         terrain=TerrainEntityCfg(terrain_type="plane"),
         entities={"robot": robot.robot_cfg()},
+        sensors=tuple(sensors),
     )
 
 
-def make_sim(robot: RobotSpec) -> SimulationCfg:
-    return SimulationCfg(
+def make_sim(robot: RobotSpec, contact_sensor_maxmatch: int | None = None) -> SimulationCfg:
+    """The simulation settings of ``robot``. ``contact_sensor_maxmatch``, if given, sets the contact sensors' match
+    limit (SimulationCfg.contact_sensor_maxmatch); without it mjlab's default holds."""
+    cfg = SimulationCfg(
         njmax=robot.njmax,
         nconmax=robot.nconmax,
         mujoco=MujocoCfg(
@@ -91,6 +96,9 @@ def make_sim(robot: RobotSpec) -> SimulationCfg:
             ccd_iterations=robot.solver[3],
         ),
     )
+    if contact_sensor_maxmatch is not None:
+        cfg.contact_sensor_maxmatch = contact_sensor_maxmatch
+    return cfg
 
 
 def placed_state(ref, c: DomainRandCfg, noise: bool, uniforms: dict | None = None):
@@ -144,13 +152,17 @@ class TrackingSim:
 
     def __init__(self, sim_cfg: SimulationCfg, num_envs: int, robot: RobotSpec, motion: MotionLib, mdp: MDP,
                  device: str, gamma: float = 0.99, eval_mode: bool = False, max_episode_steps: int | None = None,
-                 reset_noise: bool = True, randomize: bool | None = None, fail_reset: float = 0.0, bin_fix: bool = False):  # fmt: skip
+                 reset_noise: bool = True, randomize: bool | None = None, fail_reset: float = 0.0, bin_fix: bool = False,
+                 sensors: tuple[SensorCfg, ...] = ()):  # fmt: skip
         """``randomize`` (default: not eval_mode) switches domain randomization, observation noise and
         delay, and pushes; ``eval_mode`` switches evaluation bookkeeping (no auto-reset, episode starts
         exactly on the reference). The control period is the motion library's row period (``motion.dt``), split into
-        physics steps of PHYSICS_DT; ``max_episode_steps`` defaults to EPISODE_S of controls."""
+        physics steps of PHYSICS_DT; ``max_episode_steps`` defaults to EPISODE_S of controls. ``sensors`` are mjlab
+        sensors added to the scene (:func:`make_scene_cfg`); the scene updates them after every physics step and
+        reset() resets them. reset_masked does not reset them; camera and ray-cast sensors are not updated, since the
+        simulator does not run mjlab's sense pipeline."""
         self.device = device
-        self.scene = Scene(make_scene_cfg(robot, num_envs), device=device)
+        self.scene = Scene(make_scene_cfg(robot, num_envs, sensors), device=device)
         self.sim = Simulation(num_envs=num_envs, cfg=sim_cfg, model=self.scene.compile(), device=device)
         self.scene.initialize(mj_model=self.sim.mj_model, model=self.sim.model, data=self.sim.data)
         self.robot = self.scene["robot"]
