@@ -51,7 +51,10 @@ if not _run_args:  # a downloaded policy file alone: the flags it was trained wi
     _run_args = torch.load(sorted(glob.glob(os.path.join(args.run_dir, "ckpt_*.pt")))[0], map_location="cpu", weights_only=False)["args"]
 motion = MotionLib.load(robot, kin, dev, _run_args.get("motion_dir"), args.bones_list or _run_args.get("bones_list"),
                          args.bones_lib or _run_args.get("bones_lib"), _run_args.get("motion_store", "full"))
-mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
+# difference from the release code: the policy observation of the run (train.py --obs_root_offset; a run without the
+# flag, as every release run, observes the release's); evaluation adds no observation noise
+mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing,
+          root_offset=_run_args.get("obs_root_offset", False))
 C = len(motion.names)
 L = motion.clip_len.cpu()
 # with fewer than 1024 worlds the same checkpoint scores about 0.001 lower (256 / 512 worlds: 0.9478 / 0.9479
@@ -64,6 +67,8 @@ ORDER = torch.argsort(L, descending=True, stable=True).to(dev)  # longest first
 
 def load_policy(ck):
     a_ = ck["args"]
+    # difference from the release code: a checkpoint must observe what the run's observation gives (--obs_root_offset)
+    assert a_.get("obs_root_offset", False) == mdp.obs_root_offset, "checkpoint and run differ in --obs_root_offset"
     widths = lambda key: tuple(int(x) for x in a_.get(key, "2048,1024,512,256").split(","))  # noqa: E731
     pi = Policy(mdp.obs_dim, motion.goal_dim(a_["goal_frames"]), robot.num_joints, hist=a_["hist"],
                 enc_hidden=widths("enc_hidden"), dec_hidden=widths("dec_hidden"), **policy_kwargs(a_, robot)).to(dev)  # fmt: skip

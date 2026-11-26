@@ -20,15 +20,25 @@ def state_dim(J: int) -> int:
     return 3 + 4 + 3 + 3 + J + J
 
 
-def obs_dim(J: int) -> int:
-    return J + J + 3 + 3 + J + 6
+ROOT_OFFSET_DIM = 2
+"""Difference from the release code (train.py --obs_root_offset, off by default): the size of the observation term
+that the option appends, the reference root's horizontal offset from the robot's root (``MDP.root_offset``)."""
 
 
-def obs_scale(J: int) -> torch.Tensor:
+def obs_dim(J: int, root_offset: bool = False) -> int:
+    # Difference from the release code: with ``root_offset`` (train.py --obs_root_offset) the observation ends with the
+    # two components of MDP.root_offset; without it the size is the release's
+    return J + J + 3 + 3 + J + 6 + (ROOT_OFFSET_DIM if root_offset else 0)
+
+
+def obs_scale(J: int, root_offset: bool = False) -> torch.Tensor:
     # normalization of the obs before the policy (qd and angular velocity are large)
-    return torch.cat(
-        (torch.ones(J), torch.full((J,), 0.1), torch.full((3,), 0.25), torch.ones(3), torch.ones(J), torch.ones(6))
-    )
+    # Difference from the release code: with ``root_offset`` (train.py --obs_root_offset) one more scale of 1 per
+    # component of MDP.root_offset; without it the release's tensor
+    parts = (torch.ones(J), torch.full((J,), 0.1), torch.full((3,), 0.25), torch.ones(3), torch.ones(J), torch.ones(6))
+    if root_offset:
+        parts = parts + (torch.ones(ROOT_OFFSET_DIM),)
+    return torch.cat(parts)
 
 
 CONTACT_Z = 0.045  # ankle-roll link origin height below which a foot counts as in contact
@@ -85,7 +95,11 @@ def inv_dim(J: int) -> int:
 
 class MDP:
     def __init__(self, kin: Kinematics, motion: MotionLib, default_q: torch.Tensor, xi_dim: int,
-                 sensing: SensingCfg = SensingCfg(), cfg: RewardCfg = RewardCfg()):  # fmt: skip
+                 sensing: SensingCfg = SensingCfg(), cfg: RewardCfg = RewardCfg(),
+                 root_offset: bool = False, root_offset_noise: float = 0.0):  # fmt: skip
+        """Difference from the release code: ``root_offset`` (train.py --obs_root_offset; default off, the release's
+        observation) appends MDP.root_offset to the policy observation, with uniform noise of half-width
+        ``root_offset_noise`` (m) where the observation is noisy (train.py --obs_root_offset_noise)."""
         self.kin, self.motion, self.cfg = kin, motion, cfg
         self.default_q = default_q
         mid, half = (kin.q_lo + kin.q_hi) / 2, (kin.q_hi - kin.q_lo) / 2
@@ -93,14 +107,24 @@ class MDP:
         dev = default_q.device
         J = default_q.shape[0]
         self.num_j = J
-        self.obs_dim, self.xi_dim = obs_dim(J), xi_dim
+        self.obs_root_offset = bool(root_offset)
+        self.obs_dim, self.xi_dim = obs_dim(J, self.obs_root_offset), xi_dim
         self.critic_extra = J + len(kin.tracked_idx) * 3 + 3 + 6 + self.xi_dim
-        self.obs_noise = obs_noise(sensing, J).to(dev)
-        self.obs_scale = obs_scale(J).to(dev)
+        self.obs_noise = obs_noise(sensing, J, root_offset_noise if self.obs_root_offset else None).to(dev)
+        self.obs_scale = obs_scale(J, self.obs_root_offset).to(dev)
         # contact reward (training only): tracked-body indices of the feet, set by the trainer
         self.feet: list[int] = []
 
     # ---------------- observation ----------------
+    def root_offset(self, S, f) -> torch.Tensor:
+        """Difference from the release code (train.py --obs_root_offset): the reference root's horizontal offset from
+        the robot's root, reference minus robot, in the robot's heading frame (the yaw of its root, as the critic's
+        root error ``e_root``), x and y: (..., 2). The release policy does not observe it. ``p`` is the root position
+        relative to the world's origin in the simulator and the world model's integrated position in imagination, both
+        in the frame of the reference's ``root_p``; on a robot it needs an estimate of the root's position."""
+        p, R = S[0], S[1]
+        return mv3(yaw_mat(R).transpose(-1, -2), self.motion.root_p[f] - p)[..., :ROOT_OFFSET_DIM]
+
     def obs(self, S, a_prev, xi, f) -> torch.Tensor:
         """Noise-free proprioceptive observation (+ reference-relative root orientation)."""
         p, R, v, w, q, qd = S
@@ -108,6 +132,8 @@ class MDP:
         dq0 = xi[..., 1 : 1 + q.shape[-1]]
         g_b = -R[..., 2, :]  # R^T (0,0,-1)
         rel = mat_to_6d(mm3(Rt, self.motion.root_R[f]))
+        if self.obs_root_offset:  # difference from the release code (--obs_root_offset; off: the release's return below)
+            return torch.cat((q - self.default_q - dq0, qd, mv3(Rt, w), g_b, a_prev, rel, self.root_offset(S, f)), -1)
         return torch.cat((q - self.default_q - dq0, qd, mv3(Rt, w), g_b, a_prev, rel), -1)
 
     def add_noise(self, o: torch.Tensor) -> torch.Tensor:
