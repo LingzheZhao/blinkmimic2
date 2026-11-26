@@ -1,7 +1,8 @@
 """Policy observation as the robot's sensors and state estimator produce it.
 
 Observation layout (same as :meth:`blinkmimic2.mdp.MDP.obs`): q - q0 - offset, qd, angular velocity,
-projected gravity, previous action, reference-relative root orientation (6D). The default
+projected gravity, previous action, reference-relative root orientation (6D); with train.py --obs_root_offset (a
+difference from the release code, off by default) also the reference root's horizontal offset (2). The default
 :class:`SensingCfg` is the paper's: true state plus uniform noise (Table A.1). A robot can add its
 signal chain, as on a real robot's state estimator:
 
@@ -79,17 +80,21 @@ class SensingCfg:
         return self.delay_hold_prob is not None or self.imu is not None or self.joint_vel_filter is not None
 
 
-def obs_noise(cfg: SensingCfg, J: int) -> torch.Tensor:
-    return torch.cat(
-        (
-            torch.full((J,), cfg.noise_joint_pos),
-            torch.full((J,), cfg.noise_joint_vel),
-            torch.full((3,), cfg.noise_ang_vel),
-            torch.full((3,), cfg.noise_gravity),
-            torch.zeros(J),
-            torch.full((6,), cfg.noise_ref_ori),
-        )
+def obs_noise(cfg: SensingCfg, J: int, root_offset_noise: float | None = None) -> torch.Tensor:
+    # Difference from the release code: a ``root_offset_noise`` (m; train.py --obs_root_offset with
+    # --obs_root_offset_noise) appends that half-width for the two components of MDP.root_offset; None (the default)
+    # gives the release's tensor
+    parts = (
+        torch.full((J,), cfg.noise_joint_pos),
+        torch.full((J,), cfg.noise_joint_vel),
+        torch.full((3,), cfg.noise_ang_vel),
+        torch.full((3,), cfg.noise_gravity),
+        torch.zeros(J),
+        torch.full((6,), cfg.noise_ref_ori),
     )
+    if root_offset_noise is not None:
+        parts = parts + (torch.full((2,), float(root_offset_noise)),)
+    return torch.cat(parts)
 
 
 def _normalize(v: torch.Tensor) -> torch.Tensor:
@@ -121,6 +126,10 @@ class ObsPipeline:
         self.J, self.obs_dim, self.device = J, mdp.obs_dim, device
         # delay group of every observation dim: q, qd, angular velocity, attitude (gravity + ref ori); -1 = exact
         group = [0] * J + [1] * J + [2] * 3 + [3] * 3 + [-1] * J + [3] * 6
+        # Difference from the release code (train.py --obs_root_offset): the reference root's horizontal offset
+        # (MDP.root_offset) joins the group of the other reference term, the reference-relative orientation
+        if mdp.obs_root_offset:
+            group += [3] * 2
         self.group = torch.tensor([max(g, 0) for g in group], device=device)
         self.delayed = torch.tensor([g >= 0 for g in group], device=device)
         jf = self.cfg.joint_vel_filter
@@ -225,6 +234,11 @@ class ObsPipeline:
         qd_obs = st["qd_f"] if self.cfg.joint_vel_filter is not None else qd
         g_b = -R_att[..., 2, :]
         rel = mat_to_6d(R_att.transpose(-1, -2) @ self.mdp.motion.root_R[f])
+        if self.mdp.obs_root_offset:
+            # Difference from the release code (train.py --obs_root_offset; off: the release's return below): the
+            # reference root's horizontal offset from the true root position and heading (MDP.root_offset); this
+            # signal chain models no position estimator
+            return torch.cat((q - self.mdp.default_q - dq0, qd_obs, ang_vel, g_b, a_prev, rel, self.mdp.root_offset(S, f)), -1)
         return torch.cat((q - self.mdp.default_q - dq0, qd_obs, ang_vel, g_b, a_prev, rel), -1)
 
     def observe(self, st: dict, raw: torch.Tensor, noise: bool, delay: bool) -> tuple[torch.Tensor, dict]:

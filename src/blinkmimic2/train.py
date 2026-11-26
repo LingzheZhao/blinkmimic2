@@ -63,6 +63,16 @@ parser.add_argument("--critic_epochs", type=int, default=5, help="also a --phase
 parser.add_argument("--critic_minibatches", type=int, default=4)
 parser.add_argument("--contact_reward", type=float, default=0.25, help="contact-matching term in imagination (evaluation reward unchanged)")
 parser.add_argument("--fail_reset", type=float, default=0.3, help="share of practice resets one bin before recent failure points")
+# Difference from the release code: the two flags below are not in the release. Off (the default), the policy
+# observation and every code path are the release's
+parser.add_argument("--obs_root_offset", action=argparse.BooleanOptionalAction, default=False,
+                    help="the policy also observes the reference root's horizontal offset from its root (reference minus "
+                         "robot, x and y in the robot's heading frame; mdp.MDP.root_offset) wherever its observation is "
+                         "built: in the simulator, in imagination, in the pre-exams and in the deployment stream; on a "
+                         "robot it needs an estimate of the root's position")
+parser.add_argument("--obs_root_offset_noise", type=float, default=0.25,
+                    help="with --obs_root_offset: half-width (m) of the uniform noise on that offset where the policy "
+                         "observation is noisy (the official tracking task's actor uses 0.25 m on its anchor position)")
 # ---- schedule ----
 parser.add_argument("--phase", type=str, default=FINAL_PHASE,
                     help="'IT:key=v,...;IT:key=v' sets, from iteration IT on, the keys exam_frac, front_share, fail_penalty, "
@@ -112,6 +122,8 @@ parser.add_argument("--wstream_worlds", type=int, default=8192)
 parser.add_argument("--wstream_steps", type=int, default=2, help="stream steps per iteration")
 parser.add_argument("--wstream_burn", type=int, default=300, help="stream advances when it starts")
 args = parser.parse_args()
+if not 0.0 <= args.obs_root_offset_noise < math.inf:  # difference from the release code (--obs_root_offset_noise)
+    parser.error("--obs_root_offset_noise must be finite and not negative")
 
 import torch
 import torch.nn as nn
@@ -147,7 +159,9 @@ motion = MotionLib.load(robot, kin, dev, None, args.bones_list, args.bones_lib, 
 print(f"motion library: {motion.merge_tail_bins()} clip-end bins merged, {motion.num_bins} bins", flush=True)
 layout = XiLayout(robot, dev)
 normalize_xi = layout.normalize
-mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), layout.dim, robot.sensing)
+# difference from the release code: --obs_root_offset and its noise (off: the release's MDP)
+mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), layout.dim, robot.sensing,
+          root_offset=args.obs_root_offset, root_offset_noise=args.obs_root_offset_noise)
 pipe = ObsPipeline(robot, mdp, layout, dev, PHYSICS_DT)
 K, Hh, HZ = args.goal_frames, args.hist, args.horizon
 GOAL_DIM = motion.goal_dim(K)
@@ -269,6 +283,11 @@ def _wm_err(S_hat, logits, s1, mask, weight=None):
 CLIP_STATS = []
 
 
+# Difference from the release code (--obs_root_offset, off by default): every policy observation below is built by
+# mdp.obs or pipe.raw_obs, so with the option it carries the reference root's horizontal offset: in imagination from the
+# world model's state, whose root position WorldModel.integrate carries forward from the start state (the buffer's
+# simulator state or, in the pre-exams and the deployment stream, the reference's first row); the history at an
+# imagination start is rebuilt from the buffer's stored simulator states. The world model itself is unchanged.
 def _imag_step(S, o_hist, a_prev, f, xi, xi_n, g):
     a = pi(o_hist, g)
     S1 = wm.step(S, a, a_prev, xi_n)
