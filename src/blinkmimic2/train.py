@@ -648,6 +648,8 @@ def policy_update():
 # ------------------------------------------------------------------------------------------------
 sim_cfg = make_sim(robot)
 mdp.reward, mdp.termination, mdp.obs = torch.compile(mdp.reward), torch.compile(mdp.termination), torch.compile(mdp.obs)
+if args.sole_height_reward > 0:  # difference from the release code: the logged pay on the simulator's states, compiled
+    mdp.sole_pay = torch.compile(mdp.sole_pay)  # as mdp.reward, so that the collection step's CUDA graph can capture it
 motion.goal = torch.compile(motion.goal)
 env = TrackingSim(sim_cfg, args.num_envs, robot, motion, mdp, dev, gamma=args.gamma, fail_reset=args.fail_reset, bin_fix=True)
 env.aprev_ref = args.reset_aprev_ref
