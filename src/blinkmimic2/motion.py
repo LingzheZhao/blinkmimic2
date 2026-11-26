@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import math
 import os
 from typing import Callable
 
@@ -197,12 +198,16 @@ class MotionLib:
         floor = torch.lerp(v[start + lo], v[start + hi], w)[cid]
         self.ref_contact = ((z < floor + margin) & (vh < vmax)).float()
 
-    def set_ref_sole_height(self, feet: list[int], ends: torch.Tensor, radius: torch.Tensor) -> None:
+    def set_ref_sole_height(self, feet: list[int], ends: torch.Tensor, radius: torch.Tensor,
+                            max_off_floor_frames: float = math.inf) -> None:
         """Difference from the release code (train.py --sole_height_reward; the release has no such method, and the
-        trainer calls it only when the term is on): the reference's sole height per frame (num_frames, len(feet)), the
-        height above z = 0 of each foot's lowest collision-capsule point (mdp.sole_height; ``ends`` and ``radius`` from
-        kinematics.foot_capsules), clamped at 0, computed once from the reference's tracked bodies as set_ref_contact
-        computes the contact flags."""
+        trainer calls it only when the term is on), after set_ref_contact. Sets two per-frame arrays (num_frames,
+        len(feet)):
+        - ``ref_sole_height``: the reference's sole height, the height above z = 0 of each foot's lowest collision-capsule
+          point (mdp.sole_height; ``ends`` and ``radius`` from kinematics.foot_capsules), clamped at 0;
+        - ``ref_sole_gate``: 1 where the sole-height term pays that foot: the reference contact flag reads the foot off
+          the floor (ref_contact 0) in a run of consecutive such frames of one clip at most ``max_off_floor_frames``
+          long (a clip's first and last frames end a run). inf: every frame the flag reads off the floor."""
         from .mdp import sole_height
 
         hs = []
@@ -211,6 +216,20 @@ class MotionLib:
                 bp, bR, _, _ = self.ref_bodies(torch.arange(a, min(a + (1 << 20), self.num_frames), device=self.device))
                 hs.append(sole_height(bp[:, feet], bR[:, feet], ends, radius))
         self.ref_sole_height = torch.cat(hs).clamp(min=0.0)
+        off = self.ref_contact < 0.5  # (num_frames, len(feet))
+        if math.isinf(max_off_floor_frames):
+            self.ref_sole_gate = off.float()
+            return
+        first = torch.zeros(self.num_frames, dtype=torch.bool, device=off.device)
+        first[self.clip_start.to(off.device).long()] = True
+        prev = torch.cat((torch.zeros_like(off[:1]), off[:-1]))
+        starts = off & ~(prev & ~first.unsqueeze(1))  # the first off frame of each run, per foot
+        run = torch.cumsum(starts.long(), 0)  # run index per frame and foot (runs of a foot are numbered 1, 2, ...)
+        gate = torch.zeros_like(off)
+        for i in range(off.shape[1]):
+            length = torch.bincount(run[off[:, i], i], minlength=int(run[:, i].max()) + 1)  # frames per run
+            gate[:, i] = off[:, i] & (length[run[:, i]] <= max_off_floor_frames)
+        self.ref_sole_gate = gate.float()
 
     def goal_dim(self, K: int) -> int:
         return K * (3 + 6 + 3 + 3 + 2 * self.q.shape[-1])

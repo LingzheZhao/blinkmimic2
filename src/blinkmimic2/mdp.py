@@ -162,12 +162,15 @@ class MDP:
         the reference foot is down. Evaluation keeps ``w_contact = 0``, i.e. the paper's reward.
 
         Difference from the release code (train.py --sole_height_reward; ``w_sole = 0``, the default, leaves the
-        release's reward): ``w_sole`` > 0 adds a sole-height term, per foot, in the rows where the reference's foot is
-        off the floor (the reference contact flag of MotionLib.set_ref_contact is 0): min(h, min(h_ref, U)) / U, h the
-        height of the foot's lowest collision-capsule point (clamped at 0), h_ref the reference's (MotionLib.
-        set_ref_sole_height), U = SOLE_HEIGHT_UNIT; summed over the feet, times w_sole and dt. Linear in the sole's
-        height up to the reference's, nothing above it; at most 2 w_sole dt per step. Like the contact term it is
-        added in imagination only (train.py), so the simulator's evaluation reward stays the release's."""
+        release's reward): ``w_sole`` > 0 adds a sole-height term, per foot, in the rows where MotionLib's
+        ``ref_sole_gate`` is 1 (the reference's foot off the floor by the contact flag of set_ref_contact, in an
+        off-the-floor run no longer than train.py's --sole_height_max_off_floor_time): min(h, min(h_ref, U)) / U, h the
+        height of the foot's lowest collision-capsule point (clamped at 0, so a foot on the floor gets no slope from
+        the term), h_ref the reference's (MotionLib.set_ref_sole_height), U = SOLE_HEIGHT_UNIT; summed over the feet,
+        times w_sole and dt (``sole_pay``). Linear in the sole's height up to the reference's, nothing above it; at
+        most w_sole dt per gated foot and step. Like the contact term it is added in imagination only (train.py), so
+        the simulator's evaluation reward stays the release's. With ``terms``, its unweighted pay is returned as
+        "sole_pay"."""
         c, m = self.cfg, self.motion
         p, R, v, w, q, qd = S
         bp, bR, bv, bw = self.kin.forward(p, R, v, w, q, qd)
@@ -204,13 +207,18 @@ class MDP:
             r_contact = (1 - (c_sim - c_ref) ** 2) + c_ref * torch.exp(-slip / 0.3**2)
             r = r + w_contact * r_contact.mean(-1) * CONTROL_DT
         if w_sole > 0:  # difference from the release code (--sole_height_reward; off: this block is skipped)
-            ends, radius = self.sole_capsules
-            h = sole_height(bp[..., self.feet, :], bR[..., self.feet, :, :], ends, radius).clamp(min=0.0)
-            h_ref = m.ref_sole_height[f]  # MotionLib.set_ref_sole_height, clamped at 0 there
-            rc = getattr(m, "ref_contact", None)  # MotionLib.set_ref_contact, else the fixed 4.5 cm (as the contact term)
-            c_ref = rc[f] if rc is not None else (rbp[..., self.feet, 2] < CONTACT_Z).float()
-            pay = torch.minimum(h, h_ref.clamp(max=SOLE_HEIGHT_UNIT)) / SOLE_HEIGHT_UNIT
-            r = r + w_sole * ((1 - c_ref) * pay).sum(-1) * CONTROL_DT
+            sole_pay = self._sole_pay(bp, bR, f)
+            r = r + w_sole * sole_pay * CONTROL_DT
+        if terms and w_sole > 0:  # difference from the release code (--sole_height_reward): the term's unweighted pay
+            return r, {
+                "track": r_track * CONTROL_DT,
+                "e_body_pos": e_pos,
+                "e_body_ori": e_ori,
+                "e_root_pos": e_rp,
+                "action_rate": r_rate,
+                "joint_limit": r_lim,
+                "sole_pay": sole_pay,
+            }
         if terms:
             return r, {
                 "track": r_track * CONTROL_DT,
@@ -221,6 +229,21 @@ class MDP:
                 "joint_limit": r_lim,
             }
         return r
+
+    def _sole_pay(self, bp, bR, f) -> torch.Tensor:
+        """Difference from the release code (train.py --sole_height_reward): the sole-height term's unweighted pay of
+        the tracked bodies bp, bR against reference frame f, summed over the feet (0 to the number of gated feet)."""
+        ends, radius = self.sole_capsules
+        h = sole_height(bp[..., self.feet, :], bR[..., self.feet, :, :], ends, radius).clamp(min=0.0)
+        h_ref = self.motion.ref_sole_height[f]  # MotionLib.set_ref_sole_height, clamped at 0 there
+        gate = self.motion.ref_sole_gate[f]  # MotionLib.set_ref_sole_height: off the floor in a short enough run
+        return (gate * torch.minimum(h, h_ref.clamp(max=SOLE_HEIGHT_UNIT)) / SOLE_HEIGHT_UNIT).sum(-1)
+
+    def sole_pay(self, S, f) -> torch.Tensor:
+        """Difference from the release code (train.py --sole_height_reward; the trainer logs it): ``_sole_pay`` of state
+        S against reference frame f."""
+        bp, bR, _, _ = self.kin.forward(*S)
+        return self._sole_pay(bp, bR, f)
 
     def termination(self, S, f) -> torch.Tensor:
         p, R = S[0], S[1]

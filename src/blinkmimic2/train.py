@@ -77,10 +77,16 @@ parser.add_argument("--obs_root_offset_noise", type=float, default=0.25,
 # bound and every code path are the release's
 parser.add_argument("--sole_height_reward", type=float, default=0.0,
                     help="weight of a sole-height term in imagination (mdp.MDP.reward, w_sole): per foot, in the reference "
-                         "rows where the trainer reads the reference's foot as off the floor (MotionLib.set_ref_contact), "
-                         "the height of the foot's lowest collision-capsule point up to the reference's, over "
-                         "mdp.SOLE_HEIGHT_UNIT (0.05 m, above which it pays no more); the simulator's evaluation reward is "
-                         "unchanged, as for --contact_reward; 0 = off")
+                         "rows where the trainer reads the reference's foot as off the floor (MotionLib.set_ref_contact) "
+                         "within a run of such rows no longer than --sole_height_max_off_floor_time, the height of the "
+                         "foot's lowest collision-capsule point up to the reference's, over mdp.SOLE_HEIGHT_UNIT (0.05 m, "
+                         "above which it pays no more); the simulator's evaluation reward is unchanged, as for "
+                         "--contact_reward; 0 = off")
+parser.add_argument("--sole_height_max_off_floor_time", type=float, default=math.inf,
+                    help="with --sole_height_reward: the term pays a foot only in runs of consecutive reference rows with "
+                         "that foot off the floor (MotionLib.set_ref_contact) lasting at most this long (s; a run of n rows "
+                         "lasts n x 20 ms), for example the hopping foot's short flights and not the free leg's swing; "
+                         "inf (the default) pays every row with the foot off the floor")
 # ---- schedule ----
 parser.add_argument("--phase", type=str, default=FINAL_PHASE,
                     help="'IT:key=v,...;IT:key=v' sets, from iteration IT on, the keys exam_frac, front_share, fail_penalty, "
@@ -134,6 +140,8 @@ if not 0.0 <= args.obs_root_offset_noise < math.inf:  # difference from the rele
     parser.error("--obs_root_offset_noise must be finite and not negative")
 if not 0.0 <= args.sole_height_reward < math.inf:  # difference from the release code (--sole_height_reward)
     parser.error("--sole_height_reward must be finite and not negative")
+if not args.sole_height_max_off_floor_time > 0.0:  # difference from the release code (--sole_height_max_off_floor_time)
+    parser.error("--sole_height_max_off_floor_time must be positive (inf: no limit)")
 
 import torch
 import torch.nn as nn
@@ -227,11 +235,9 @@ assert not args.front_share or (N_EX > 0), \
     "--front_share needs --exam_frac"
 critic = Critic(CRITIC_IN).to(dev)
 VMAX = (MAX_STEP_REWARD + max(args.contact_reward, 0.0) * 2 * CONTROL_DT) / (1 - args.gamma)  # bound on the critic value (largest per-step reward over 1 - gamma)
-if args.sole_height_reward > 0:  # difference from the release code (--sole_height_reward; off: the release's bound)
-    VMAX = (MAX_STEP_REWARD + max(args.contact_reward, 0.0) * 2 * CONTROL_DT
-            + args.sole_height_reward * 2 * CONTROL_DT) / (1 - args.gamma)  # the term pays at most 1 per foot
 VCL = torch.zeros(4, device=dev)  # summed clamped fractions (GAE V, targets, actor bootstrap), count
-print(f"critic value bound V_max = {VMAX:.4g}", flush=True)
+if not args.sole_height_reward > 0:  # difference from the release code: with the sole-height term, printed with its part below
+    print(f"critic value bound V_max = {VMAX:.4g}", flush=True)
 GRAPH = True
 assert not pipe.stateful, "CUDA graphs: not with stateful sensing"
 fused = ({"fused": True})
@@ -275,7 +281,15 @@ if args.sole_height_reward > 0:  # difference from the release code (--sole_heig
     from blinkmimic2.kinematics import foot_capsules
 
     mdp.sole_capsules = foot_capsules(robot, [robot.tracked_bodies[i] for i in FEET], dev)
-    motion.set_ref_sole_height(FEET, *mdp.sole_capsules)
+    motion.set_ref_sole_height(FEET, *mdp.sole_capsules,
+                               max_off_floor_frames=args.sole_height_max_off_floor_time / CONTROL_DT + 1e-6)
+    SOLE_FEET = int(motion.ref_sole_gate.sum(-1).max())  # the most feet the term pays in one reference row
+    # the critic's bound adds the term's largest pay per step: one per paid foot
+    VMAX = (MAX_STEP_REWARD + max(args.contact_reward, 0.0) * 2 * CONTROL_DT
+            + args.sole_height_reward * SOLE_FEET * CONTROL_DT) / (1 - args.gamma)
+    print(f"critic value bound V_max = {VMAX:.4g} (with the sole-height term: at most {SOLE_FEET} paid feet per row; "
+          f"paid foot-rows {int(motion.ref_sole_gate.sum())} of {2 * motion.num_frames})", flush=True)
+SOLE = torch.zeros(4, device=dev)  # difference from the release code (--sole_height_reward): summed pay means, counts
 
 
 def _contact_bce(logits, S1):
@@ -339,9 +353,10 @@ def _imag_step_sensed(S, o_hist, a_prev, f, xi, xi_n, g, st):
 
 
 def _reward_term(S, f, a, a_prev):
-    # difference from the release code: w_sole (--sole_height_reward; 0, the default, is the release's reward)
-    return (mdp.reward(S, f, a, a_prev, w_contact=args.contact_reward, w_sole=args.sole_height_reward),
-            mdp.soft_termination(S, f, scale=1.0))
+    if args.sole_height_reward > 0:  # difference from the release code (--sole_height_reward): the term and its pay
+        r, terms = mdp.reward(S, f, a, a_prev, terms=True, w_contact=args.contact_reward, w_sole=args.sole_height_reward)
+        return r, mdp.soft_termination(S, f, scale=1.0), terms["sole_pay"]
+    return mdp.reward(S, f, a, a_prev, w_contact=args.contact_reward), mdp.soft_termination(S, f, scale=1.0)
 
 
 def _gae_targets(V, rews, dones):
@@ -546,7 +561,11 @@ def policy_update():
     flat = lambda xs: torch.stack(xs).flatten(0, 1)  # noqa: E731  (H*B, ...)
     S_all = tuple(flat([St[i] for St in Ss]) for i in range(6))
     f_all = flat(Fs)
-    r, d = reward_term(S_all, f_all, flat(As), flat(Aps))
+    if args.sole_height_reward > 0:  # difference from the release code: the term's imagined pay is logged (train.log)
+        r, d, sole_pay = reward_term(S_all, f_all, flat(As), flat(Aps))
+        SOLE[0].add_(sole_pay.detach().mean()), SOLE[1].add_(1.0)
+    else:
+        r, d = reward_term(S_all, f_all, flat(As), flat(Aps))
     r, d = r.view(HZ, B), d.view(HZ, B)
     r_log = r  # the tracking reward alone (log column imag_r)
     if args.fail_penalty > 0:
@@ -947,6 +966,8 @@ def _collect_core():
             ae = torch.where(env.exam[-N_EX:, None], ae, a[-N_EX:])
         a = torch.cat((a[:-N_EX], ae))
     out = env.step_core(a)
+    if args.sole_height_reward > 0:  # difference from the release code: the term's pay on the simulator's states (log only)
+        SOLE[2].add_(mdp.sole_pay(unflatten_state(out["s1"]), out["f"] + 1).mean()), SOLE[3].add_(1.0)
     if N_EX:  # before the resets below, which draw the next exam clips from the updated table
         exam_record(out)
     buffer.add_device(out)
@@ -1292,6 +1313,11 @@ for it in range(start_it, args.iterations):
         vc = VCL.tolist()
         VCL.zero_()
         print(f"   vclamp | V {vc[0] / max(vc[3], 1):.4f} targets {vc[1] / max(vc[3], 1):.4f} boot {vc[2] / max(vc[3], 1):.4f} above V_max", flush=True)
+        if args.sole_height_reward > 0:  # difference from the release code: the term's unweighted pay per step
+            sl = SOLE.tolist()
+            SOLE.zero_()
+            print(f"   sole height pay | imagined {sl[0] / max(sl[1], 1):.4f} simulated {sl[2] / max(sl[3], 1):.4f} "
+                  "per step, summed over the feet", flush=True)
         print(f"it {it + 1} | {wall_h:.3f} h | wm {row[3]:.4f} e8 {row[4]:.4f} | pi {row[5]:.3f} v {row[6]:.4f} imag_r {row[7]:.3f} surv {row[9]:.3f} "
               f"| sim_r {row[10]:.3f} ep_len {row[11]:.1f} ep_ret {row[12]:.3f} term {term_frac:.2f} | {ips:.2f} it/s", flush=True)  # fmt: skip
         stats = {k: [] for k in stats}
