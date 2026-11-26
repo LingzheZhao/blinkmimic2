@@ -159,8 +159,8 @@ class TrackingSim:
         exactly on the reference). The control period is the motion library's row period (``motion.dt``), split into
         physics steps of PHYSICS_DT; ``max_episode_steps`` defaults to EPISODE_S of controls. ``sensors`` are mjlab
         sensors added to the scene (:func:`make_scene_cfg`); the scene updates them after every physics step and
-        reset() resets them. reset_masked does not reset them; camera and ray-cast sensors are not updated, since the
-        simulator does not run mjlab's sense pipeline."""
+        reset() resets them. reset_masked does not reset them. The data of camera and ray-cast sensors is not computed,
+        since the simulator does not run mjlab's sense pipeline (Simulation.sense)."""
         self.device = device
         self.scene = Scene(make_scene_cfg(robot, num_envs, sensors), device=device)
         self.sim = Simulation(num_envs=num_envs, cfg=sim_cfg, model=self.scene.compile(), device=device)

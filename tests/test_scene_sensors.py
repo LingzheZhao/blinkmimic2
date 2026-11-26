@@ -1,7 +1,9 @@
 """Sensors added to the tracking scene (env.make_scene_cfg, TrackingSim) and the contact sensors' match limit
-(env.make_sim). With the defaults the scene compiles to the former model and the simulation settings equal the former
-ones; a contact sensor between the feet and the floor compiles to MuJoCo contact sensors on those bodies and leaves the
-rest of the model unchanged. MuJoCo's compiler and mjlab's simulation set-up on the CPU, without stepping."""
+(env.make_sim). With the defaults the scene compiles to the model built without the sensors argument and the
+simulation settings equal those built without the match limit; a contact sensor between the feet and the floor compiles
+to MuJoCo contact sensors on those bodies and leaves the model's sizes, the body masses, the geoms' type, size,
+friction, condim and priority, and the existing sensors unchanged. MuJoCo's compiler and mjlab's simulation set-up on
+the CPU, without stepping."""
 
 import os
 import sys
@@ -28,14 +30,14 @@ FLOOR = ContactSensorCfg(name="feet_floor", primary=ContactMatch(mode="subtree",
                          history_length=8)  # fmt: skip
 
 
-def former_scene_cfg(num_envs: int) -> SceneCfg:
-    """make_scene_cfg before the sensors argument."""
+def plain_scene_cfg(num_envs: int) -> SceneCfg:
+    """The scene configuration built without the sensors argument."""
     return SceneCfg(num_envs=num_envs, env_spacing=0.0, terrain=TerrainEntityCfg(terrain_type="plane"),
                     entities={"robot": ROBOT.robot_cfg()})  # fmt: skip
 
 
-def former_sim_cfg() -> SimulationCfg:
-    """make_sim before the contact_sensor_maxmatch argument."""
+def plain_sim_cfg() -> SimulationCfg:
+    """The simulation settings built without the contact_sensor_maxmatch argument."""
     return SimulationCfg(njmax=ROBOT.njmax, nconmax=ROBOT.nconmax,
                          mujoco=MujocoCfg(timestep=PHYSICS_DT, integrator="implicitfast", cone="pyramidal", solver="newton",
                                           iterations=ROBOT.solver[0], ls_iterations=ROBOT.solver[1],
@@ -58,10 +60,10 @@ def stop_at_scene(cfg, device):
 
 
 class TestSceneSensors(unittest.TestCase):
-    def test_defaults_compile_to_the_former_model(self):
+    def test_defaults_compile_to_the_model_without_sensors(self):
         self.assertEqual(make_scene_cfg(ROBOT, 2).sensors, ())
         got = Scene(make_scene_cfg(ROBOT, 2), device="cpu").compile()
-        want = Scene(former_scene_cfg(2), device="cpu").compile()
+        want = Scene(plain_scene_cfg(2), device="cpu").compile()
         np.testing.assert_array_equal(model_bytes(got), model_bytes(want))
 
     def test_trackingsim_passes_its_sensors(self):
@@ -93,8 +95,8 @@ class TestSceneSensors(unittest.TestCase):
 
 
 class TestMatchLimit(unittest.TestCase):
-    def test_default_is_the_former_simulation(self):
-        self.assertEqual(make_sim(ROBOT), former_sim_cfg())
+    def test_default_settings_equal_those_built_without_the_argument(self):
+        self.assertEqual(make_sim(ROBOT), plain_sim_cfg())
         self.assertEqual(make_sim(ROBOT).contact_sensor_maxmatch, SimulationCfg().contact_sensor_maxmatch)
 
     def test_given_limit_reaches_the_simulation(self):
