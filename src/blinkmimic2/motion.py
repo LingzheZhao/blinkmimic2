@@ -197,6 +197,21 @@ class MotionLib:
         floor = torch.lerp(v[start + lo], v[start + hi], w)[cid]
         self.ref_contact = ((z < floor + margin) & (vh < vmax)).float()
 
+    def set_ref_sole_height(self, feet: list[int], ends: torch.Tensor, radius: torch.Tensor) -> None:
+        """Difference from the release code (train.py --sole_height_reward; the release has no such method, and the
+        trainer calls it only when the term is on): the reference's sole height per frame (num_frames, len(feet)), the
+        height above z = 0 of each foot's lowest collision-capsule point (mdp.sole_height; ``ends`` and ``radius`` from
+        kinematics.foot_capsules), clamped at 0, computed once from the reference's tracked bodies as set_ref_contact
+        computes the contact flags."""
+        from .mdp import sole_height
+
+        hs = []
+        with torch.no_grad():
+            for a in range(0, self.num_frames, 1 << 20):
+                bp, bR, _, _ = self.ref_bodies(torch.arange(a, min(a + (1 << 20), self.num_frames), device=self.device))
+                hs.append(sole_height(bp[:, feet], bR[:, feet], ends, radius))
+        self.ref_sole_height = torch.cat(hs).clamp(min=0.0)
+
     def goal_dim(self, K: int) -> int:
         return K * (3 + 6 + 3 + 3 + 2 * self.q.shape[-1])
 

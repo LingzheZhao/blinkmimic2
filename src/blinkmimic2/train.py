@@ -73,6 +73,14 @@ parser.add_argument("--obs_root_offset", action=argparse.BooleanOptionalAction, 
 parser.add_argument("--obs_root_offset_noise", type=float, default=0.25,
                     help="with --obs_root_offset: half-width (m) of the uniform noise on that offset where the policy "
                          "observation is noisy (the official tracking task's actor uses 0.25 m on its anchor position)")
+# Difference from the release code: the flag below is not in the release. At 0 (the default) the reward, the critic's
+# bound and every code path are the release's
+parser.add_argument("--sole_height_reward", type=float, default=0.0,
+                    help="weight of a sole-height term in imagination (mdp.MDP.reward, w_sole): per foot, in the reference "
+                         "rows where the trainer reads the reference's foot as off the floor (MotionLib.set_ref_contact), "
+                         "the height of the foot's lowest collision-capsule point up to the reference's, over "
+                         "mdp.SOLE_HEIGHT_UNIT (0.05 m, above which it pays no more); the simulator's evaluation reward is "
+                         "unchanged, as for --contact_reward; 0 = off")
 # ---- schedule ----
 parser.add_argument("--phase", type=str, default=FINAL_PHASE,
                     help="'IT:key=v,...;IT:key=v' sets, from iteration IT on, the keys exam_frac, front_share, fail_penalty, "
@@ -124,6 +132,8 @@ parser.add_argument("--wstream_burn", type=int, default=300, help="stream advanc
 args = parser.parse_args()
 if not 0.0 <= args.obs_root_offset_noise < math.inf:  # difference from the release code (--obs_root_offset_noise)
     parser.error("--obs_root_offset_noise must be finite and not negative")
+if not 0.0 <= args.sole_height_reward < math.inf:  # difference from the release code (--sole_height_reward)
+    parser.error("--sole_height_reward must be finite and not negative")
 
 import torch
 import torch.nn as nn
@@ -217,6 +227,9 @@ assert not args.front_share or (N_EX > 0), \
     "--front_share needs --exam_frac"
 critic = Critic(CRITIC_IN).to(dev)
 VMAX = (MAX_STEP_REWARD + max(args.contact_reward, 0.0) * 2 * CONTROL_DT) / (1 - args.gamma)  # bound on the critic value (largest per-step reward over 1 - gamma)
+if args.sole_height_reward > 0:  # difference from the release code (--sole_height_reward; off: the release's bound)
+    VMAX = (MAX_STEP_REWARD + max(args.contact_reward, 0.0) * 2 * CONTROL_DT
+            + args.sole_height_reward * 2 * CONTROL_DT) / (1 - args.gamma)  # the term pays at most 1 per foot
 VCL = torch.zeros(4, device=dev)  # summed clamped fractions (GAE V, targets, actor bootstrap), count
 print(f"critic value bound V_max = {VMAX:.4g}", flush=True)
 GRAPH = True
@@ -257,6 +270,12 @@ FOOT_CONTACT_Z = 0.045  # ankle-roll link origin below this height: the foot is 
 mdp.feet = FEET
 assert args.contact_reward == 0 or FEET, "--contact_reward needs foot bodies (g1)"
 motion.set_ref_contact(FEET)
+if args.sole_height_reward > 0:  # difference from the release code (--sole_height_reward; off: nothing is computed)
+    assert FEET, "--sole_height_reward needs foot bodies (g1)"
+    from blinkmimic2.kinematics import foot_capsules
+
+    mdp.sole_capsules = foot_capsules(robot, [robot.tracked_bodies[i] for i in FEET], dev)
+    motion.set_ref_sole_height(FEET, *mdp.sole_capsules)
 
 
 def _contact_bce(logits, S1):
@@ -320,7 +339,9 @@ def _imag_step_sensed(S, o_hist, a_prev, f, xi, xi_n, g, st):
 
 
 def _reward_term(S, f, a, a_prev):
-    return mdp.reward(S, f, a, a_prev, w_contact=args.contact_reward), mdp.soft_termination(S, f, scale=1.0)
+    # difference from the release code: w_sole (--sole_height_reward; 0, the default, is the release's reward)
+    return (mdp.reward(S, f, a, a_prev, w_contact=args.contact_reward, w_sole=args.sole_height_reward),
+            mdp.soft_termination(S, f, scale=1.0))
 
 
 def _gae_targets(V, rews, dones):

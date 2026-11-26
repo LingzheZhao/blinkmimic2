@@ -43,6 +43,17 @@ def obs_scale(J: int, root_offset: bool = False) -> torch.Tensor:
 
 CONTACT_Z = 0.045  # ankle-roll link origin height below which a foot counts as in contact
 MAX_STEP_REWARD = (4 * 1.0 + 2 * 0.5) * CONTROL_DT
+SOLE_HEIGHT_UNIT = 0.05
+"""Difference from the release code (train.py --sole_height_reward, off by default): the sole height in metres at which
+the sole-height term pays one per foot, and above which it pays no more (MDP.reward)."""
+
+
+def sole_height(bp: torch.Tensor, bR: torch.Tensor, ends: torch.Tensor, radius: torch.Tensor) -> torch.Tensor:
+    """Difference from the release code (train.py --sole_height_reward): the height above z = 0 of each foot's lowest
+    collision-capsule point, (..., F), from the feet's world positions bp (..., F, 3) and rotations bR (..., F, 3, 3) and
+    the capsules' end points ``ends`` (F, E, 3) in the foot's frame with their radii (F, E) (kinematics.foot_capsules)."""
+    z = bp[..., 2:3] + torch.einsum("...fk,fek->...fe", bR[..., 2, :], ends)
+    return (z - radius).amin(-1)
 
 
 @dataclass
@@ -114,6 +125,9 @@ class MDP:
         self.obs_scale = obs_scale(J, self.obs_root_offset).to(dev)
         # contact reward (training only): tracked-body indices of the feet, set by the trainer
         self.feet: list[int] = []
+        # Difference from the release code (train.py --sole_height_reward): the feet's collision capsules (end points in
+        # the foot's frame and radii, kinematics.foot_capsules), set by the trainer when the sole-height term is on
+        self.sole_capsules: tuple[torch.Tensor, torch.Tensor] | None = None
 
     # ---------------- observation ----------------
     def root_offset(self, S, f) -> torch.Tensor:
@@ -140,12 +154,20 @@ class MDP:
         return o + (2 * torch.rand_like(o) - 1) * self.obs_noise
 
     # ---------------- reward / termination ----------------
-    def reward(self, S, f, a, a_prev, terms: bool = False, w_contact: float = 0.0):
+    def reward(self, S, f, a, a_prev, terms: bool = False, w_contact: float = 0.0, w_sole: float = 0.0):
         """Per-step reward (already multiplied by dt) comparing S with reference frame f.
 
         ``w_contact`` > 0 adds a contact term: a smooth foot-contact indicator (ankle-roll
         origin below 4.5 cm) matched to the reference's contact state, plus low horizontal foot speed while
-        the reference foot is down. Evaluation keeps ``w_contact = 0``, i.e. the paper's reward."""
+        the reference foot is down. Evaluation keeps ``w_contact = 0``, i.e. the paper's reward.
+
+        Difference from the release code (train.py --sole_height_reward; ``w_sole = 0``, the default, leaves the
+        release's reward): ``w_sole`` > 0 adds a sole-height term, per foot, in the rows where the reference's foot is
+        off the floor (the reference contact flag of MotionLib.set_ref_contact is 0): min(h, min(h_ref, U)) / U, h the
+        height of the foot's lowest collision-capsule point (clamped at 0), h_ref the reference's (MotionLib.
+        set_ref_sole_height), U = SOLE_HEIGHT_UNIT; summed over the feet, times w_sole and dt. Linear in the sole's
+        height up to the reference's, nothing above it; at most 2 w_sole dt per step. Like the contact term it is
+        added in imagination only (train.py), so the simulator's evaluation reward stays the release's."""
         c, m = self.cfg, self.motion
         p, R, v, w, q, qd = S
         bp, bR, bv, bw = self.kin.forward(p, R, v, w, q, qd)
@@ -181,6 +203,14 @@ class MDP:
             slip = (bv[..., self.feet, :2] ** 2).sum(-1)
             r_contact = (1 - (c_sim - c_ref) ** 2) + c_ref * torch.exp(-slip / 0.3**2)
             r = r + w_contact * r_contact.mean(-1) * CONTROL_DT
+        if w_sole > 0:  # difference from the release code (--sole_height_reward; off: this block is skipped)
+            ends, radius = self.sole_capsules
+            h = sole_height(bp[..., self.feet, :], bR[..., self.feet, :, :], ends, radius).clamp(min=0.0)
+            h_ref = m.ref_sole_height[f]  # MotionLib.set_ref_sole_height, clamped at 0 there
+            rc = getattr(m, "ref_contact", None)  # MotionLib.set_ref_contact, else the fixed 4.5 cm (as the contact term)
+            c_ref = rc[f] if rc is not None else (rbp[..., self.feet, 2] < CONTACT_Z).float()
+            pay = torch.minimum(h, h_ref.clamp(max=SOLE_HEIGHT_UNIT)) / SOLE_HEIGHT_UNIT
+            r = r + w_sole * ((1 - c_ref) * pay).sum(-1) * CONTROL_DT
         if terms:
             return r, {
                 "track": r_track * CONTROL_DT,

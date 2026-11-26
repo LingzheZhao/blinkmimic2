@@ -89,3 +89,36 @@ class Kinematics:
             torch.stack([V[i] for i in idx], -2),
             torch.stack([W[i] for i in idx], -2),
         )
+
+
+def foot_capsules(robot: RobotSpec, bodies: list[str], device: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Difference from the release code (train.py --sole_height_reward; the release has no such function): the end
+    points of the collision capsules of each body in ``bodies``, in that body's frame, from the compiled MJCF, with the
+    radius of the capsule each end point belongs to: ``(ends (len(bodies), E, 3), radius (len(bodies), E))``, E = twice
+    the largest number of capsules of one body (a body with fewer repeats its last end point). The lowest point of a
+    capsule lies one radius below its lower end point, so a body's lowest capsule point is the least (end point height
+    - its radius) (``mdp.sole_height``). A body without collision capsules is refused."""
+    m = mujoco.MjModel.from_xml_path(robot.mjcf_path)
+    all_ends, all_radii = [], []
+    for name in bodies:
+        b = m.body(name).id
+        ends, radii = [], []
+        for g in range(m.ngeom):
+            if m.geom_bodyid[g] != b or m.geom_type[g] != mujoco.mjtGeom.mjGEOM_CAPSULE:
+                continue
+            if m.geom_contype[g] == 0 and m.geom_conaffinity[g] == 0:
+                continue  # a capsule that collides with nothing is not collision geometry
+            rot = np.zeros(9)
+            mujoco.mju_quat2Mat(rot, m.geom_quat[g])
+            half = rot.reshape(3, 3)[:, 2] * m.geom_size[g, 1]  # the capsule's axis is its frame's z, half-length size[1]
+            for sign in (1.0, -1.0):
+                ends.append(m.geom_pos[g] + sign * half)
+                radii.append(float(m.geom_size[g, 0]))
+        if not ends:
+            raise ValueError(f"{robot.mjcf_path}: body {name} has no collision capsules")
+        all_ends.append(ends), all_radii.append(radii)
+    E = max(len(e) for e in all_ends)
+    all_ends = [e + [e[-1]] * (E - len(e)) for e in all_ends]
+    all_radii = [r + [r[-1]] * (E - len(r)) for r in all_radii]
+    return (torch.tensor(np.array(all_ends), dtype=torch.float32, device=device),
+            torch.tensor(np.array(all_radii), dtype=torch.float32, device=device))  # fmt: skip
