@@ -199,15 +199,18 @@ class MotionLib:
         self.ref_contact = ((z < floor + margin) & (vh < vmax)).float()
 
     def set_ref_sole_height(self, feet: list[int], ends: torch.Tensor, radius: torch.Tensor,
-                            max_off_floor_frames: float = math.inf) -> None:
+                            max_off_floor_frames: float = math.inf, target_offset: float = 0.0) -> None:
         """Difference from the release code (train.py --sole_height_reward; the release has no such method, and the
-        trainer calls it only when the term is on), after set_ref_contact. Sets two per-frame arrays (num_frames,
+        trainer calls it only when the term is on), after set_ref_contact. Sets three per-frame arrays (num_frames,
         len(feet)):
         - ``ref_sole_height``: the reference's sole height, the height above z = 0 of each foot's lowest collision-capsule
           point (mdp.sole_height; ``ends`` and ``radius`` from kinematics.foot_capsules), clamped at 0;
         - ``ref_sole_gate``: 1 where the sole-height term pays that foot: the reference contact flag reads the foot off
           the floor (ref_contact 0) in a run of consecutive such frames of one clip at most ``max_off_floor_frames``
-          long (a clip's first and last frames end a run). inf: every frame the flag reads off the floor."""
+          long (a clip's first and last frames end a run). inf: every frame the flag reads off the floor. The runs are
+          found on the contact flags alone; ``target_offset`` then removes rows from them (``_lower_sole_target``);
+        - ``ref_sole_target``: the height up to which the term pays, ``ref_sole_height`` lowered by ``target_offset``
+          (m; train.py --sole_height_target_offset; 0, the default, leaves it ``ref_sole_height`` itself)."""
         from .mdp import sole_height
 
         hs = []
@@ -219,8 +222,8 @@ class MotionLib:
         off = self.ref_contact < 0.5  # (num_frames, len(feet))
         if math.isinf(max_off_floor_frames):
             self.ref_sole_gate = off.float()
-            return
-        first = torch.zeros(self.num_frames, dtype=torch.bool, device=off.device)
+            return self._lower_sole_target(target_offset)
+        first =torch.zeros(self.num_frames, dtype=torch.bool, device=off.device)
         first[self.clip_start.to(off.device).long()] = True
         prev = torch.cat((torch.zeros_like(off[:1]), off[:-1]))
         starts = off & ~(prev & ~first.unsqueeze(1))  # the first off frame of each run, per foot
@@ -230,6 +233,21 @@ class MotionLib:
             length = torch.bincount(run[off[:, i], i], minlength=int(run[:, i].max()) + 1)  # frames per run
             gate[:, i] = off[:, i] & (length[run[:, i]] <= max_off_floor_frames)
         self.ref_sole_gate = gate.float()
+        self._lower_sole_target(target_offset)
+
+    def _lower_sole_target(self, target_offset: float) -> None:
+        """Difference from the release code (train.py --sole_height_target_offset; the release has no such method):
+        sets ``ref_sole_target``, the reference's sole height lowered by ``target_offset`` metres and clamped at 0, and
+        leaves out of ``ref_sole_gate`` the rows whose reference sole height is not above the offset, so that the term
+        pays min(h, h_ref - offset, cap) / cap only where h_ref > offset (mdp.MDP._sole_pay). The gate's off-the-floor
+        runs were found before, on the contact flags alone, so removing rows does not split a long run into paid short
+        ones. At 0 (the default) the gate is left as it is and ``ref_sole_target`` is ``ref_sole_height`` itself: the
+        term as it was without the offset."""
+        if target_offset > 0:
+            self.ref_sole_gate = self.ref_sole_gate * (self.ref_sole_height > target_offset).float()
+            self.ref_sole_target = (self.ref_sole_height - target_offset).clamp(min=0.0)
+        else:
+            self.ref_sole_target = self.ref_sole_height
 
     def goal_dim(self, K: int) -> int:
         return K * (3 + 6 + 3 + 3 + 2 * self.q.shape[-1])

@@ -87,6 +87,11 @@ parser.add_argument("--sole_height_max_off_floor_time", type=float, default=math
                          "that foot off the floor (MotionLib.set_ref_contact) lasting at most this long (s; a run of n rows "
                          "lasts n x 20 ms), for example the hopping foot's short flights and not the free leg's swing; "
                          "inf (the default) pays every row with the foot off the floor")
+parser.add_argument("--sole_height_target_offset", type=float, default=0.0,
+                    help="with --sole_height_reward: metres by which the term's target, the reference's sole height, is "
+                         "lowered: a paid row pays min(h, h_ref - offset, 0.05 m) / 0.05 m, and rows with h_ref at or "
+                         "below the offset are not paid (the off-the-floor runs of --sole_height_max_off_floor_time are "
+                         "found before, on the contact flags alone); 0 (the default) is the term without it")
 # ---- schedule ----
 parser.add_argument("--phase", type=str, default=FINAL_PHASE,
                     help="'IT:key=v,...;IT:key=v' sets, from iteration IT on, the keys exam_frac, front_share, fail_penalty, "
@@ -142,6 +147,8 @@ if not 0.0 <= args.sole_height_reward < math.inf:  # difference from the release
     parser.error("--sole_height_reward must be finite and not negative")
 if not args.sole_height_max_off_floor_time > 0.0:  # difference from the release code (--sole_height_max_off_floor_time)
     parser.error("--sole_height_max_off_floor_time must be positive (inf: no limit)")
+if not 0.0 <= args.sole_height_target_offset < math.inf:  # difference from the release code (--sole_height_target_offset)
+    parser.error("--sole_height_target_offset must be finite and not negative")
 
 import torch
 import torch.nn as nn
@@ -282,13 +289,17 @@ if args.sole_height_reward > 0:  # difference from the release code (--sole_heig
 
     mdp.sole_capsules = foot_capsules(robot, [robot.tracked_bodies[i] for i in FEET], dev)
     motion.set_ref_sole_height(FEET, *mdp.sole_capsules,
-                               max_off_floor_frames=args.sole_height_max_off_floor_time / CONTROL_DT + 1e-6)
+                               max_off_floor_frames=args.sole_height_max_off_floor_time / CONTROL_DT + 1e-6,
+                               target_offset=args.sole_height_target_offset)
     SOLE_FEET = int(motion.ref_sole_gate.sum(-1).max())  # the most feet the term pays in one reference row
-    # the critic's bound adds the term's largest pay per step: one per paid foot
+    # the critic's bound adds the term's largest pay per step: one per paid foot (also with --sole_height_target_offset,
+    # which only removes paid rows and lowers the pay of the others: min(h, h_ref - offset, U) / U is at most 1)
     VMAX = (MAX_STEP_REWARD + max(args.contact_reward, 0.0) * 2 * CONTROL_DT
             + args.sole_height_reward * SOLE_FEET * CONTROL_DT) / (1 - args.gamma)
     print(f"critic value bound V_max = {VMAX:.4g} (with the sole-height term: at most {SOLE_FEET} paid feet per row; "
-          f"paid foot-rows {int(motion.ref_sole_gate.sum())} of {2 * motion.num_frames})", flush=True)
+          f"paid foot-rows {int(motion.ref_sole_gate.sum())} of {2 * motion.num_frames})"
+          + (f"; target lowered by {args.sole_height_target_offset:g} m" if args.sole_height_target_offset > 0 else ""),
+          flush=True)  # fmt: skip
 SOLE = torch.zeros(4, device=dev)  # difference from the release code (--sole_height_reward): summed pay means, counts
 
 
