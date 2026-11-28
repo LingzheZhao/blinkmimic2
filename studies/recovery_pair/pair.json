@@ -45,7 +45,7 @@
     "F": "twins with a counted fall, of the 100",
     "C": "clips of the 40 completed from their first row under the recipe's termination",
     "C_getup": "whether each of the five hidden get-up clips is completed",
-    "E": "body-position error in metres: the command's bodies moved under the body's torso_link by the alignment of BeyondMimic (arXiv:2508.08241v4, Supplementary Text S1, Anchor), applied to all 14 tracked bodies; the distance averaged over the bodies, over each clip's controls before its first termination and over the 40 clips",
+    "E": "body-position error in metres: the command's bodies moved under the body's torso_link by the alignment of BeyondMimic (arXiv:2508.08241v4, Supplementary Text S1, Anchor), applied to all 14 tracked bodies; the distance averaged over the bodies, over each clip's controls before the control of its first termination, that control excluded, and over the 40 clips",
     "seed suffixes": "C0, C1, E0 and E1 are C and E of the control trainings of seeds 0 and 1; R0 and R1 are R of the recovery trainings of seeds 0 and 1"
   },
   "margins": {

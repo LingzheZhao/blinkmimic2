@@ -314,11 +314,11 @@ within at every term):
 
 No outcome row that holds reads these terms; the rows that read them need both seeds in gets_up. Each term rests on one
 rollout per save; four first-row rollouts of seed 0 at 7,000 read C 36 to 38 for the recovery save and 39 to 40 for the
-control ("Repeated rollouts of one checkpoint" below). E reads each clip up to its first termination, so where the
-completed clips differ the clips are read over different spans: at 7,000 the recovery save misses
-fallAndGetUp1_subject4, fallAndGetUp2_subject2, fallAndGetUp3_subject1 and fightAndSports1_subject1 against none
-(seed 0), and fallAndGetUp2_subject3 against run1_subject5 (seed 1); the controls at 3,500 miss walk2_subject3
-(seed 0) and dance1_subject2, fightAndSports1_subject1 and walk2_subject1 (seed 1).
+control ("Repeated rollouts of one checkpoint" below). E reads each clip over its controls before the control of its
+first termination, so where the completed clips differ the clips are read over different spans: at 7,000 the recovery
+save misses fallAndGetUp1_subject4, fallAndGetUp2_subject2, fallAndGetUp3_subject1 and fightAndSports1_subject1
+against none (seed 0), and fallAndGetUp2_subject3 against run1_subject5 (seed 1); the controls at 3,500 miss
+walk2_subject3 (seed 0) and dance1_subject2, fightAndSports1_subject1 and walk2_subject1 (seed 1).
 
 **Exposure.** The recovery saves at 7,000 have 321,061,586 (seed 0) and 319,211,717 (seed 1) imagined tracking
 controls, which a control reaches at iterations 4,900 and 4,871; a control has 229,376,000 at 3,500 and 458,752,000 at
@@ -444,7 +444,7 @@ starts.
 
 **Commanded and excluded clips (exploratory).** The recovery policies' commands exclude six get-up clips (the five
 hidden clips and fallAndGetUp1_subject4). The final saves, one rollout each; E over a group is the mean of its clips'
-errors, each read up to the clip's first termination:
+errors, each read over the clip's controls before the control of its first termination:
 
 | Final save, seed 0 / seed 1 | Completed of 34 commanded | E over 34 (m) | Completed of 6 excluded | E over 6 (m) |
 | --- | --- | --- | --- | --- |
