@@ -60,6 +60,17 @@ TRACKED_BODIES = [
     "right_shoulder_roll_link", "right_elbow_link", "right_wrist_yaw_link",
 ]  # fmt: skip
 
+# The candidate support links of DynaMimic's link inputs to the world model (train.py --wm_link_inputs): the 18 bodies
+# of mjlab's G1 collision model that carry collision geoms, all of which touch the floor in the get-up clips of the
+# library. DynaMimic (arXiv 2611.32944) uses 15 candidate links on its robot; a set of 15 cannot be left-right
+# symmetric here, and the world model is fitted on mirrored windows half the time (--wm_mirror), so all 18 are used.
+SUPPORT_LINKS = (
+    "pelvis", "left_hip_roll_link", "left_hip_yaw_link", "left_knee_link", "left_ankle_roll_link",
+    "right_hip_roll_link", "right_hip_yaw_link", "right_knee_link", "right_ankle_roll_link", "torso_link",
+    "left_shoulder_yaw_link", "left_elbow_link", "left_wrist_pitch_link", "left_wrist_yaw_link",
+    "right_shoulder_yaw_link", "right_elbow_link", "right_wrist_pitch_link", "right_wrist_yaw_link",
+)  # fmt: skip
+
 # Per-joint (effort limit, velocity limit, armature) by motor type.
 _M5020 = (25.0, 37.0, ARMATURE_5020)
 _M4010 = (5.0, 22.0, ARMATURE_4010)

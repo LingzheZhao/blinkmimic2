@@ -81,11 +81,17 @@ class WorldModel(nn.Module):
     """
 
     def __init__(self, num_j: int, xi_dim: int, use_prev_action: bool = False, hidden=(2048, 2048, 2048),
-                 contact_modes: bool = False, structured: bool = False, dt: float = 0.02):  # fmt: skip
+                 contact_modes: bool = False, structured: bool = False, dt: float = 0.02,
+                 link_kinematics=None, link_bodies=()):  # fmt: skip
         """``contact_modes``: the last layer predicts the two feet's next-step ground contact
         and one increment head per contact mode (flight, left, right, double support); the increment is the
         mixture of the heads weighted by the predicted mode probabilities, so each head stays smooth within
-        its mode instead of one MLP smoothing across touch-down and lift-off."""
+        its mode instead of one MLP smoothing across touch-down and lift-off.
+
+        ``link_bodies`` (names of the robot's links, with ``link_kinematics``, a kinematics.Kinematics): DynaMimic's
+        link inputs (arXiv 2611.32944, "Predicting contact wrenches"); the inputs also hold, per link, its height,
+        its position relative to the base and its linear velocity (``link_features``). Empty: the release's
+        inputs."""
         super().__init__()
         self.num_j = num_j
         self.use_prev_action = use_prev_action
@@ -93,7 +99,10 @@ class WorldModel(nn.Module):
         # ``structured`` = semi-implicit integration (positions follow the predicted velocities,
         # the net predicts velocity increments plus small position corrections)
         self.structured, self.dt = structured, dt
-        self.in_dim = inv_dim(num_j) + num_j * (2 if use_prev_action else 1) + xi_dim
+        self.link_kinematics = link_kinematics
+        self.link_bodies = tuple(link_bodies)
+        self.link_index = [link_kinematics.body_names.index(b) for b in self.link_bodies] if self.link_bodies else []
+        self.in_dim = inv_dim(num_j) + num_j * (2 if use_prev_action else 1) + xi_dim + 7 * len(self.link_bodies)
         self.out_dim = 3 + 3 + 3 + 3 + num_j + num_j
         n_out = 4 * self.out_dim + 2 if contact_modes else self.out_dim
         self.net = mlp(self.in_dim, list(hidden), n_out, act=nn.SiLU, layer_norm=True)
@@ -106,9 +115,10 @@ class WorldModel(nn.Module):
         self.inc_norm = RunningNorm(self.out_dim, eps=1e-4)
 
     def inputs(self, S, a, a_prev, xi_n):
+        links = (link_features(self.link_kinematics, self.link_index, S),) if self.link_bodies else ()
         if self.use_prev_action:
-            return torch.cat((invariant_features(S), a, a_prev, xi_n), -1)
-        return torch.cat((invariant_features(S), a, xi_n), -1)
+            return torch.cat((invariant_features(S), a, a_prev, xi_n) + links, -1)
+        return torch.cat((invariant_features(S), a, xi_n) + links, -1)
 
     # weight of the new velocity in the position drift: n semi-implicit substeps with a linearly changing
     # velocity give sum_k k/n / n = (n + 1) / (2 n); n = 4 substeps -> 0.625 (measured residual std of the
@@ -205,6 +215,62 @@ class WorldModel(nn.Module):
             ),
             -1,
         )
+
+
+def link_features(kin, index, S) -> torch.Tensor:
+    """DynaMimic's link inputs of states ``S`` (..., 7 x links): for each link of the kinematics ``kin`` at ``index``
+    (positions in ``kin.body_names``), its height (world z of its origin), its origin's position relative to the base
+    and its origin's linear velocity, both in the heading frame of the base (rotations.yaw_mat, the frame of the world
+    model's increments), so that the features do not change with the base's heading or planar position."""
+    p, R, v, w, q, qd = S
+    bp, _, bv, _ = kin.forward(p, R, v, w, q, qd, all_bodies=True)
+    bp, bv = bp[..., index, :], bv[..., index, :]
+    Ht = yaw_mat(R).transpose(-1, -2).unsqueeze(-3)
+    return torch.cat((bp[..., 2:3], mv3(Ht, bp - p.unsqueeze(-2)), mv3(Ht, bv)), -1).flatten(-2)
+
+
+def build_world_model(robot, xi_dim: int, a_: dict, kinematics=None) -> WorldModel:
+    """The world model (``WorldModel``) as train.py builds it for a run with the training arguments ``a_``
+    (args.json or a checkpoint's ``args``): ``--wm_hidden`` widths, ``--wm_link_inputs`` links (with ``kinematics``,
+    the trainer's kinematics.Kinematics; none without the option), the previous action where the robot delays its
+    actuators, no contact modes, semi-implicit (``structured``) integration at the control period. The last two
+    settings are not train.py options."""
+    from .motion import CONTROL_DT
+
+    hidden = tuple(int(x) for x in a_["wm_hidden"].split(","))
+    links = tuple(a_.get("wm_link_inputs") or ())
+    if links and kinematics is None:
+        raise ValueError("the world model's link inputs need the robot's kinematics")
+    return WorldModel(robot.num_joints, xi_dim, use_prev_action=robot.has_action_delay, hidden=hidden,
+                      contact_modes=False, structured=True, dt=CONTROL_DT,
+                      link_kinematics=kinematics if links else None, link_bodies=links)
+
+
+def world_model_error_floor(num_j: int) -> torch.Tensor:
+    """train.py's per-component lower bounds on the scale of the world model's error (root position, root
+    rotation, root linear velocity, root angular velocity, joint position and joint velocity increments): the error
+    scale is max(inc_norm.std(), lower bound)."""
+    return torch.cat((torch.full((3,), 3e-3), torch.full((3,), 5e-3), torch.full((3,), 2e-2), torch.full((3,), 5e-2),
+                      torch.full((num_j,), 3e-3), torch.full((num_j,), 5e-2)))
+
+
+def world_model_error_scale(model: WorldModel) -> torch.Tensor:
+    """train.py's scale of the world model's error: max(inc_norm.std(), lower bound) per component (12 + 2J)."""
+    return torch.maximum(model.inc_norm.std(), world_model_error_floor(model.num_j).to(model.inc_norm.var.device))
+
+
+def world_model_error_components(model: WorldModel, S_hat, S, scale=None) -> torch.Tensor:
+    """The squared components (..., 12 + 2J) of train.py's error of the world model's predicted states
+    ``S_hat`` against states ``S``: the frame-local state error (root position, root rotation, root linear velocity,
+    root angular velocity, joint positions, joint velocities) over ``scale`` (default the model's own,
+    world_model_error_scale), squared."""
+    return (model.state_error(S_hat, S) / (world_model_error_scale(model) if scale is None else scale)) ** 2
+
+
+def world_model_normalized_error(model: WorldModel, S_hat, S) -> torch.Tensor:
+    """train.py's error of the world model's predicted states ``S_hat`` against states ``S``: the
+    components of ``world_model_error_components`` averaged (..., )."""
+    return world_model_error_components(model, S_hat, S).mean(-1)
 
 
 class Policy(nn.Module):
