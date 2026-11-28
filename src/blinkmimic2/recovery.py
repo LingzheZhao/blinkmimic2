@@ -230,6 +230,20 @@ def termination(start_recovering, stop, release):
     return torch.where(start_recovering, stop.to(release.dtype), release)
 
 
+def failure_penalty(mdp, S, row, weight):
+    """train.py --recovery_fail_penalty: ``weight`` (a number or a scalar tensor) times the soft termination
+    (mdp.soft_termination, the form of the release's --fail_penalty) of the states ``S`` against the target rows ``row``
+    of recovery.advance (the hidden row while recovering, the command row otherwise), with gradient; at least 0,
+    subtracted from the step reward."""
+    return weight * mdp.soft_termination(S, row, scale=1.0)
+
+
+def penalty_weight(iteration: int, weight: float, first_iteration: float) -> float:
+    """The weight of --recovery_fail_penalty WEIGHT FIRST_ITERATION at an iteration: 0 before FIRST_ITERATION, WEIGHT
+    from it on (the release turns --fail_penalty on in the same way through its schedule, at iteration 2000)."""
+    return float(weight) if iteration >= first_iteration else 0.0
+
+
 def value_bound(gamma: float, w_contact: float, reward_scale: float) -> float:
     """train.py's bound on the critic value, the largest step reward over 1 - gamma, with the tracking part of the step
     reward (at most MAX_STEP_REWARD) times the larger of the recovery reward scale and 1 (the largest scale of a

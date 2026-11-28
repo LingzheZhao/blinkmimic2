@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -285,6 +286,26 @@ class TestTerminationAndBound(unittest.TestCase):
         self.assertAlmostEqual(recovery.value_bound(0.99, 0.25, 2.5), 26.0, places=9)
         # below 1 the tracking and blend controls (scale up to 1) keep the release's bound
         self.assertEqual(recovery.value_bound(0.99, 0.25, 0.5), release)
+
+
+class TestFailurePenaltyAtTheTargetRow(unittest.TestCase):
+    def test_the_soft_termination_at_the_target_row_times_the_weight(self):
+        lying = state_of([0, 0])
+        rows = torch.tensor([0, 35])  # a lying body: at its own (hidden) row, and under an upright command row
+        pen = recovery.failure_penalty(MDP_, lying, rows, 3.0)
+        self.assertTrue(torch.equal(pen, 3.0 * MDP_.soft_termination(lying, rows, scale=1.0)))
+        self.assertLess(float(pen[0]), 0.01)
+        self.assertGreater(float(pen[1]), 2.97)
+        # outside recovery the target row is the command row: the release's penalty (--fail_penalty) form
+        S = state_of([35])
+        self.assertTrue(torch.equal(recovery.failure_penalty(MDP_, S, torch.tensor([35]), 3.0),
+                                    3.0 * MDP_.soft_termination(S, torch.tensor([35]))))
+
+    def test_it_has_a_gradient_through_the_state(self):
+        z = float(MOTION.root_p[35][2]) - 0.25  # at the height threshold of row 35
+        S = state_of([35], z=[z], grad=True)
+        recovery.failure_penalty(MDP_, S, torch.tensor([35]), 3.0).sum().backward()
+        self.assertGreater(float(S[0].grad[0, 2].abs()), 1.0)
 
 
 def release_reward(m, S, f, a, a_prev, terms=False, w_contact=0.0):
@@ -709,6 +730,48 @@ class TestOptions(unittest.TestCase):
             self.assertEqual(r.returncode, 2)
             self.assertIn("the recovery options are refused with " + ", ".join(REFUSED), r.stderr)
             self.assertFalse(os.path.exists(os.path.join(d, "run")))
+
+    def test_the_failure_penalty_at_the_target_row(self):
+        with tempfile.TemporaryDirectory() as d:
+            r = train(os.path.join(d, "a"), *preset("recovery_control"), "--recovery_fail_penalty", "3", "2000")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("--recovery_fail_penalty needs the recovery options, a weight above 0", r.stderr)
+            for values in (("0", "2000"), ("3", "-1"), ("3", "2000.5")):
+                r = train(os.path.join(d, "b"), *preset("recovery"), "--recovery_fail_penalty", *values)
+                self.assertEqual(r.returncode, 2, values)
+                self.assertIn("--recovery_fail_penalty needs the recovery options", r.stderr)
+            r = train(os.path.join(d, "c"), *preset("recovery"), "--recovery_fail_penalty", "3", "2000", "--fail_penalty", "3")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("refused with --fail_penalty != 0", r.stderr)
+            missing = ["--bones_list", os.path.join(d, "missing.txt")]
+            r = train(os.path.join(d, "run"), *preset("recovery"), "--recovery_fail_penalty", "3", "2000", *missing)
+            self.assertEqual(r.returncode, 1, r.stderr[-2000:])
+            run = json.load(open(os.path.join(d, "run", "args.json")))
+            r = train(os.path.join(d, "plain"), *preset("recovery"), *missing)
+            self.assertEqual(r.returncode, 1, r.stderr[-2000:])
+            plain = json.load(open(os.path.join(d, "plain", "args.json")))
+        self.assertEqual(run["recovery_fail_penalty"], [3.0, 2000.0])
+        self.assertEqual(run["fail_penalty"], 0.0)
+        self.assertNotIn("recovery_fail_penalty", plain)
+        self.assertEqual({k: v for k, v in run.items() if k not in ("recovery_fail_penalty", "log_dir")},
+                         {k: v for k, v in plain.items() if k != "log_dir"})
+        src = open(os.path.join(REPO, "src", "blinkmimic2", "train.py")).read()
+        self.assertIn("r = r - recovery.failure_penalty(mdp, S_all, flat(Rows), RECOVERY_PENALTY_WEIGHT).view(HZ, B)", src)
+        self.assertIn("RECOVERY_PENALTY_WEIGHT.fill_(recovery.penalty_weight(it, *RECOVERY_PENALTY))", src)
+
+    def test_the_penalty_starts_where_the_release_schedule_starts_its_failure_penalty(self):
+        # the release's schedule (train.py FINAL_PHASE, the default of --phase): the first entry with fail_penalty > 0
+        src = open(os.path.join(REPO, "src", "blinkmimic2", "train.py")).read()
+        schedule = "".join(re.findall(r'"([^"]*)"', src[src.index("FINAL_PHASE = ("):src.index(")", src.index("FINAL_PHASE = ("))]))
+        starts = [int(e.split(":")[0]) for e in schedule.split(";")
+                  if any(kv.split("=")[0] == "fail_penalty" and float(kv.split("=")[1]) > 0 for kv in e.split(":")[1].split(","))]
+        self.assertEqual(starts[0], 2000)
+        self.assertEqual([recovery.penalty_weight(it, 3.0, 2000) for it in (0, 1999, 2000, 6999)], [0.0, 0.0, 3.0, 3.0])
+        self.assertEqual(recovery.penalty_weight(0, 3.0, 0), 3.0)
+        # a scalar tensor weight, as train.py passes it to the captured update
+        S = state_of([0])
+        pen = recovery.failure_penalty(MDP_, S, torch.tensor([35]), torch.tensor(0.0))
+        self.assertEqual(float(pen), 0.0)
 
     def test_the_presets(self):
         self.assertEqual(preset("recovery_control"), preset("baseline") + ["--no-pi_ref_skip"])

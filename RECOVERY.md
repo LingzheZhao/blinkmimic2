@@ -176,6 +176,21 @@ within the command row's thresholds, where the hard termination is 0. In imagina
 gets 0, where a mask on the reached state's flag would give the soft termination against the command row, which is
 small but above 0 within the thresholds.
 
+**Failure penalty at the target row** (`--recovery_fail_penalty WEIGHT FIRST_ITERATION`, off by default). The
+release's failure penalty (`--fail_penalty`, refused with the recovery options) subtracts its weight times the soft
+termination (`MDP.soft_termination`) against the command row from every imagined step reward; the release's schedule
+(`--phase`, whose default `FINAL_PHASE` sets `fail_penalty=3` from iteration 2000) turns it on at iteration 2000, and
+the release keeps `--pen_horizon_only`, so the penalty acts inside the imagined rollout and the critic learns the
+tracking reward. `--phase` needs exams, which the recovery options refuse, so this option carries its own first
+iteration: from FIRST_ITERATION on (`recovery.penalty_weight`), the same form is taken against each imagined
+control's target row (`recovery.failure_penalty`): the hidden row while recovering, the command row otherwise, where
+it equals the release's. It needs the recovery options, has a gradient through the imagined states and leaves the
+termination, survival weights and dones as above. As with `--fail_penalty`, `--pen_horizon_only` decides whether the
+critic's targets include it (`PRESET[baseline]` passes `--no-pen_horizon_only`). The release's pairing is
+`--recovery_fail_penalty 3 2000 --pen_horizon_only`. NablaMimic's recipe computes its termination penalty at the
+hidden row during recovery (its `RECOVERY.md`); this option keeps BlinkMimic 2's own penalty form. Without the option
+nothing changes and `args.json` holds no `recovery_fail_penalty`.
+
 **Value bound.** The release clamps the critic's values, targets and bootstrap at `(MAX_STEP_REWARD + 2 w_c dt) /
 (1 - gamma)` = (0.1 + 0.01) / 0.01 = 11, the largest step reward over `1 - gamma` with the contact weight `w_c` =
 0.25. With recovery the tracking part is at most 2.5 times as large: `(2.5 x 0.1 + 0.01) / 0.01` = 26
@@ -248,7 +263,7 @@ The settings, the row rules, the regime rule and the reward and termination rule
 | the termination masks the command-row terms on the reached state's flag | written on the regime the control starts in: equal in the simulator; in imagination a switch control gets 0 in place of the soft termination against the command row (see Termination) |
 | a non-finite state ends the episode at once | the release's termination has no non-finite test, and none is added; in the regime rule a non-finite pelvis height or up axis is a target error, as in NablaMimic |
 | the anchor-position term and the offset use the torso link | they use the pelvis (the paper's root, this trainer's anchor) |
-| a termination penalty at the target row | no termination penalty; the release's failure penalty is refused |
+| a termination penalty at the target row | no termination penalty by default; the release's failure penalty is refused; `--recovery_fail_penalty` takes its form at the target row |
 | no contact term | the imagined contact term (weight 0.25) reads the target row and is not scaled |
 | reset bins updated by transitions that start in tracking | reset bins updated by whole tracking episodes |
 | draws: reset rows, reset noise, then the share, start and command uniforms | reset rows, the share, start and command uniforms, then the reset noise and joint offsets (the body rows must be known before the noise is applied) |

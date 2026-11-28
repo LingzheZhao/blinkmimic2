@@ -46,6 +46,11 @@ parser.add_argument("--wm_window", type=int, default=8, help="world-model traini
 parser.add_argument("--wm_batches", type=int, default=5, help="world-model updates per iteration")
 parser.add_argument("--wm_batch", type=int, default=2048)
 parser.add_argument("--wm_hidden", type=str, default="1024,1024,1024", help="world-model MLP widths")
+parser.add_argument("--wm_link_inputs", type=str, nargs="+", default=argparse.SUPPRESS, metavar="LINK",
+                    help="DynaMimic's link inputs to the world model: for each named link its height, its position "
+                         "relative to the base and its linear velocity in the base's heading frame (networks."
+                         "link_features); absent from args.json without it. The G1's candidate support links are "
+                         "g1_constants.SUPPORT_LINKS (18; DynaMimic uses 15 on its robot, see there)")
 parser.add_argument("--wm_mirror", type=float, default=0.5, help="share of each world-model batch replaced by its left-right mirror")
 parser.add_argument("--enc_hidden", type=str, default="2048,1024,512,256", help="motion-encoder MLP widths")
 parser.add_argument("--dec_hidden", type=str, default="2048,1024,512,256", help="shared-decoder MLP widths")
@@ -132,6 +137,13 @@ parser.add_argument("--recovery_reward_scale", type=float, default=argparse.SUPP
 parser.add_argument("--recovery_seconds", type=float, nargs=2, default=argparse.SUPPRESS, metavar=("STOP", "BLEND"),
                     help="consecutive seconds of target error that stop a recovery episode; seconds of the blend back to "
                          "the command")
+parser.add_argument("--recovery_fail_penalty", type=float, nargs=2, default=argparse.SUPPRESS,
+                    metavar=("WEIGHT", "FIRST_ITERATION"),
+                    help="with the recovery options: from iteration FIRST_ITERATION on, WEIGHT x the soft termination "
+                         "(mdp.soft_termination) against each imagined control's target row (the hidden row while "
+                         "recovering, the command row otherwise), subtracted from the step reward as --fail_penalty is "
+                         "(the release's schedule, FINAL_PHASE, starts --fail_penalty 3 at iteration 2000); absent from "
+                         "args.json without it")
 args = parser.parse_args()
 if args.motion_dir and args.bones_list:
     parser.error("--motion_dir is read only with an empty --bones_list (--bones_list=)")
@@ -148,7 +160,8 @@ from blinkmimic2.mdp import MAX_STEP_REWARD, MDP, inv_dim, unflatten_state
 from blinkmimic2.motion import CONTROL_DT, MotionLib
 import blinkmimic2.networks as networks
 import blinkmimic2.rotations as rotations
-from blinkmimic2.networks import Critic, Policy, WorldModel, policy_kwargs
+from blinkmimic2.networks import (Critic, Policy, WorldModel, build_world_model, world_model_error_floor,
+                                  policy_kwargs)
 from blinkmimic2.mirror import Mirror
 from blinkmimic2.objective import actor_objective
 from blinkmimic2.mdp import flatten_state
@@ -169,6 +182,11 @@ if REC_SETTINGS is not None:  # options that read the command row as if the body
     if any(_refused.values()):
         parser.error("the recovery options are refused with " + ", ".join(k for k, on in _refused.items() if on)
                      + ": each reads the command row as if the body followed it (RECOVERY.md, Host configuration)")
+RECOVERY_PENALTY = getattr(args, "recovery_fail_penalty", None)  # RECOVERY.md, "Failure penalty at the target row"
+if RECOVERY_PENALTY is not None and (REC_SETTINGS is None or not RECOVERY_PENALTY[0] > 0 or RECOVERY_PENALTY[1] < 0
+                                     or RECOVERY_PENALTY[1] != int(RECOVERY_PENALTY[1])):
+    parser.error("--recovery_fail_penalty needs the recovery options, a weight above 0 and a whole first iteration of "
+                 "at least 0")
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -201,8 +219,7 @@ widths = lambda s: tuple(int(x) for x in s.split(","))  # noqa: E731
 networks.RunningNorm.no_sync = True
 rotations.ELEMENTWISE = True
 
-wm = WorldModel(J, layout.dim, use_prev_action=robot.has_action_delay, hidden=widths(args.wm_hidden),
-                contact_modes=False, structured=True, dt=CONTROL_DT).to(dev)  # fmt: skip
+wm = build_world_model(robot, layout.dim, vars(args), kin).to(dev)  # also read by tools/world_model_error.py
 pi = Policy(mdp.obs_dim, GOAL_DIM, J, hist=Hh, enc_hidden=widths(args.enc_hidden), dec_hidden=widths(args.dec_hidden),
             **policy_kwargs(vars(args), robot)).to(dev)
 N_EX = int(round(args.exam_frac * args.num_envs))  # --exam_frac: envs N - N_EX .. N - 1 run exam episodes
@@ -249,6 +266,8 @@ critic = Critic(CRITIC_IN).to(dev)
 VMAX = (MAX_STEP_REWARD + max(args.contact_reward, 0.0) * 2 * CONTROL_DT) / (1 - args.gamma)  # bound on the critic value (largest per-step reward over 1 - gamma)
 if REC is not None:  # the tracking part of the step reward is scaled by up to the recovery reward scale
     VMAX = recovery.value_bound(args.gamma, args.contact_reward, REC.settings.reward_scale)
+# --recovery_fail_penalty: the penalty's weight at the present iteration (0 before its first iteration), on the device
+RECOVERY_PENALTY_WEIGHT = torch.zeros((), device=dev)
 VCL = torch.zeros(4, device=dev)  # summed clamped fractions (GAE V, targets, actor bootstrap), count
 if REC is not None:  # recovery log columns, summed on the device by the captured steps, read and zeroed at each log row
     SIM_COUNTS = torch.zeros(8, dtype=torch.long, device=dev)  # collect: see _collect_core
@@ -274,8 +293,7 @@ start_it, wall_offset, sim_steps = 0, 0.0, 0
 
 
 # per-component floors on the error normalization (pos, rot, lin vel, ang vel, q, qd increments)
-ERR_FLOOR = torch.cat((torch.full((3,), 3e-3), torch.full((3,), 5e-3), torch.full((3,), 2e-2), torch.full((3,), 5e-2),
-                       torch.full((J,), 3e-3), torch.full((J,), 5e-2))).to(dev)  # fmt: skip
+ERR_FLOOR = world_model_error_floor(J).to(dev)
 
 
 def _wm_rollout(s, a, a_prev, xi):
@@ -581,6 +599,8 @@ def policy_update():
     r_log = r  # the tracking reward alone (log column imag_r)
     if args.fail_penalty > 0:
         r = r - PEN * d
+    if RECOVERY_PENALTY is not None:  # the failure penalty at each control's target row (with gradient)
+        r = r - recovery.failure_penalty(mdp, S_all, flat(Rows), RECOVERY_PENALTY_WEIGHT).view(HZ, B)
     rews, dones = (r_log if args.pen_horizon_only else r).detach(), d.detach()
 
     def critic_fit():
@@ -1307,6 +1327,8 @@ def _to_cpu(o):
 for it in range(start_it, args.iterations):
     if N_EX:
         IT_T.fill_(it)
+    if RECOVERY_PENALTY is not None and it in (start_it, int(RECOVERY_PENALTY[1])):  # read by the captured update
+        RECOVERY_PENALTY_WEIGHT.fill_(recovery.penalty_weight(it, *RECOVERY_PENALTY))
     if PHASE and it in PH_ITS and it != start_it:
         phase_apply(it)
     lr = lr_at(it)
