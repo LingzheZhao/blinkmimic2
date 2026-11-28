@@ -5,7 +5,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .mdp import inv_dim, invariant_features
+from .mdp import inv_dim, invariant_features, proprio_dim
+from .moe import MIXING_HIDDEN, TAU
 from .rotations import mm3, mv3, so3_exp, yaw_mat
 
 
@@ -212,10 +213,19 @@ class Policy(nn.Module):
 
     ``ref_skip`` = (offset, q0, alpha) (--pi_ref_skip): reference-action skip connection,
     a = (q_ref(f+1) - q0) / alpha + dec(...), with q_ref(f+1) read from the raw (unnormalized) goal vector at
-    ``offset``; the network only learns the correction to tracking the reference with the PD controller."""
+    ``offset``; the network only learns the correction to tracking the reference with the PD controller.
+
+    ``moe_prop_dim`` (train.py --moe, moe.py): the decoder is replaced by two experts, decoders with the hidden widths
+    ``expert_hidden`` (default: every width of ``dec_hidden`` halved; train.py --moe_expert_hidden) (``expert_m``, the
+    tracking expert, for the commanded motion; ``expert_r``, the recovery expert), and a
+    mixing network (StableMimic's "gate"), an MLP (moe.MIXING_HIDDEN) on
+    the first ``moe_prop_dim`` entries of every normalized observation of the history (the proprioceptive part:
+    without the goal, the latent, the reference skip and the observation's reference-relative root orientation). The
+    action is w_m dec_m(z, o) + w_r dec_r(z, o) with the mixing weights [w_m, w_r] = softmax(mix(o_prop) / moe.TAU)."""
 
     def __init__(self, obs_dim: int, goal_dim: int, act_dim: int, hist: int = 10, z_dim: int = 32,
-                 enc_hidden=(2048, 1024, 512, 256), dec_hidden=(2048, 1024, 512, 256), ref_skip=None):  # fmt: skip
+                 enc_hidden=(2048, 1024, 512, 256), dec_hidden=(2048, 1024, 512, 256), ref_skip=None,
+                 moe_prop_dim: int | None = None, expert_hidden=None):  # fmt: skip
         super().__init__()
         self.hist = hist
         self.ref_off = None
@@ -224,16 +234,41 @@ class Policy(nn.Module):
             self.register_buffer("ref_q0", torch.tensor(ref_skip[1], dtype=torch.float32))
             self.register_buffer("ref_alpha", torch.tensor(ref_skip[2], dtype=torch.float32))
         self.enc = mlp(goal_dim, list(enc_hidden), z_dim)
-        self.dec = mlp(z_dim + obs_dim * hist, list(dec_hidden), act_dim)
-        with torch.no_grad():
-            self.dec[-1].weight.mul_(0.01)
-            self.dec[-1].bias.zero_()
+        self.moe = moe_prop_dim is not None
+        if expert_hidden is not None and not self.moe:
+            raise ValueError("expert_hidden needs moe_prop_dim (the MoE actor)")
+        if not self.moe:
+            self.dec = mlp(z_dim + obs_dim * hist, list(dec_hidden), act_dim)
+            with torch.no_grad():
+                self.dec[-1].weight.mul_(0.01)
+                self.dec[-1].bias.zero_()
+        else:
+            if not 0 < moe_prop_dim <= obs_dim:
+                raise ValueError(f"moe_prop_dim {moe_prop_dim} must lie in (0, {obs_dim}]")
+            widths = [h // 2 for h in dec_hidden] if expert_hidden is None else list(expert_hidden)
+            self.expert_m = mlp(z_dim + obs_dim * hist, widths, act_dim)
+            self.expert_r = mlp(z_dim + obs_dim * hist, widths, act_dim)
+            self.prop_dim = moe_prop_dim
+            self.mixing_network = mlp(moe_prop_dim * hist, list(MIXING_HIDDEN), 2)
+            with torch.no_grad():
+                for e in (self.expert_m, self.expert_r):  # as the single decoder
+                    e[-1].weight.mul_(0.01)
+                    e[-1].bias.zero_()
+                # zero logits for every input: both experts start with weight 1/2
+                self.mixing_network[-1].weight.zero_()
+                self.mixing_network[-1].bias.zero_()
         self.obs_norm = RunningNorm(obs_dim)
         self.goal_norm = RunningNorm(goal_dim)
+
+    def mlps(self) -> list:
+        """The MLPs of the policy (MuonAdam's ``mlps``): encoder and decoder, or encoder, experts and mixing network."""
+        return [self.enc, self.expert_m, self.expert_r, self.mixing_network] if self.moe else [self.enc, self.dec]
 
     def forward(self, obs_hist: torch.Tensor, goal: torch.Tensor, z: torch.Tensor | None = None) -> torch.Tensor:
         """obs_hist: (B, hist, obs_dim) noisy observations, newest last. ``z`` (optional, --batch_goal_enc) is
         ``encode(goal)`` computed beforehand, e.g. for a whole imagined horizon at once."""
+        if self.moe:
+            return self.moe_forward(obs_hist, goal, z)[0]
         o = self.obs_norm(obs_hist).flatten(-2)
         if z is None:
             z = self.encode(goal)
@@ -246,6 +281,36 @@ class Policy(nn.Module):
     def encode(self, goal: torch.Tensor) -> torch.Tensor:
         """Motion latent z from the goal features (reference only, independent of the robot state)."""
         return torch.tanh(run_mlp(self.enc, self.goal_norm(goal)))
+
+    # ---- --moe ----
+    def moe_forward(self, obs_hist: torch.Tensor, goal: torch.Tensor, z: torch.Tensor | None = None):
+        """The action of the MoE actor, and the inputs it was computed from: (a, z, o, log_w) with z the motion
+        latent, o the normalized history (B, hist, obs_dim) and log_w the log mixing weights (B, 2), tracking expert
+        first."""
+        o = self.obs_norm(obs_hist)
+        if z is None:
+            z = self.encode(goal)
+        mu_m, mu_r = self.experts(z, o)
+        log_w = self.mixing_log_weights(o)
+        w = log_w.exp()
+        a = w[..., :1] * mu_m + w[..., 1:] * mu_r
+        if self.ref_off is not None:
+            q_ref = goal[..., self.ref_off : self.ref_off + a.shape[-1]]
+            a = a + (q_ref - self.ref_q0) / self.ref_alpha
+        return a, z, o, log_w
+
+    def experts(self, z: torch.Tensor, o: torch.Tensor):
+        """The two experts' actions (mu_m, mu_r) from the latent z and the normalized history o,
+        (..., hist, obs_dim)."""
+        x = torch.cat((z, o.flatten(-2)), -1)
+        return run_mlp(self.expert_m, x), run_mlp(self.expert_r, x)
+
+    def mixing_log_weights(self, o: torch.Tensor) -> torch.Tensor:
+        """The log mixing weights log softmax(mix(o_prop) / TAU) (..., 2) from the normalized history o,
+        (..., hist, obs_dim): the mixing network reads
+        the first ``prop_dim`` entries of each observation only."""
+        logits = run_mlp(self.mixing_network, o[..., : self.prop_dim].flatten(-2)).float()
+        return torch.log_softmax(logits / TAU, -1)
 
 
 def anchor_sq_dist(pi: Policy, pi_ref: Policy, obs_hist: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
@@ -270,8 +335,16 @@ def collect_actions(pi: Policy, pi_det, obs_hist: torch.Tensor, goal: torch.Tens
 
 
 def policy_kwargs(a_: dict, robot) -> dict:
-    """Policy keyword arguments of a run with the training arguments ``a_``."""
-    return {"ref_skip": policy_ref_skip(a_, robot)}
+    """Policy keyword arguments of a run with the training arguments ``a_``. With --moe (an ``a_`` with "moe" true; runs
+    without the option have no such key) the MoE actor, whose mixing network reads the observation's proprioceptive
+    part;
+    with --moe_expert_hidden (key "moe_expert_hidden", absent without the option) the experts' hidden widths."""
+    kw = {"ref_skip": policy_ref_skip(a_, robot)}
+    if a_.get("moe", False):
+        kw["moe_prop_dim"] = proprio_dim(robot.num_joints)
+    if a_.get("moe_expert_hidden") is not None:
+        kw["expert_hidden"] = tuple(int(x) for x in a_["moe_expert_hidden"].split(","))
+    return kw
 
 
 def policy_ref_skip(a_: dict, robot):

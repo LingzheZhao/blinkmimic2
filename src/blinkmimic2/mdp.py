@@ -24,6 +24,13 @@ def obs_dim(J: int) -> int:
     return J + J + 3 + 3 + J + 6
 
 
+def proprio_dim(J: int) -> int:
+    """The proprioceptive part of the observation (MDP.obs), its first entries: joint positions and velocities, angular
+    velocity, gravity in the body frame and the previous action, without the reference-relative root orientation (6)
+    that ends it."""
+    return J + J + 3 + 3 + J
+
+
 def obs_scale(J: int) -> torch.Tensor:
     # normalization of the obs before the policy (qd and angular velocity are large)
     return torch.cat(
