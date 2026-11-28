@@ -9,7 +9,7 @@ from .recovery import KEYS as REGIME_KEYS
 
 
 def fields(num_j: int, xi_dim: int, obs_dim: int | None = None, obs_state_dim: int | None = None,
-           danger: bool = False, recovery: bool = False) -> dict:
+           danger: bool = False, recovery: bool = False, tracking_target_flag: bool = False) -> dict:
     out = {
         "s": (state_dim(num_j), torch.float32),
         "s1": (state_dim(num_j), torch.float32),
@@ -33,14 +33,17 @@ def fields(num_j: int, xi_dim: int, obs_dim: int | None = None, obs_state_dim: i
         out["error_controls"] = ((), torch.long)
         out["blend_left"] = ((), torch.long)
         out["command_offset"] = (2, torch.float32)
+    if tracking_target_flag:  # train.py --moe: whether the episode keeps the tracking mixing target (moe.FLAG)
+        out["keeps_tracking_target"] = ((), torch.bool)
     return out
 
 
 class ReplayBuffer:
     def __init__(self, T: int, N: int, device: str, num_j: int, xi_dim: int, obs_dim: int | None = None,
-                 obs_state_dim: int | None = None, danger: bool = False, recovery: bool = False):  # fmt: skip
+                 obs_state_dim: int | None = None, danger: bool = False, recovery: bool = False,
+                 tracking_target_flag: bool = False):  # fmt: skip
         self.T, self.N, self.device = T, N, device
-        self.fields = fields(num_j, xi_dim, obs_dim, obs_state_dim, danger, recovery)
+        self.fields = fields(num_j, xi_dim, obs_dim, obs_state_dim, danger, recovery, tracking_target_flag)
         self.data = {}
         for k, (shape, dt) in self.fields.items():
             shp = (T, N) + ((shape,) if isinstance(shape, int) else shape)
@@ -169,6 +172,8 @@ class ReplayBuffer:
         hist_d = {k: self.data[k][hrows, henv] for k in ("s", "a_prev", "xi", "f") + (("o",) if stateful else ())}
         if "recovering" in self.data:  # recovery training: the start's regime (the history reads command rows only)
             start.update({k: self.data[k][row, env] for k in REGIME_KEYS})
+        if "keeps_tracking_target" in self.data:  # --moe: the flag of the start's episode
+            start["keeps_tracking_target"] = self.data["keeps_tracking_target"][row, env]
         return start, hist_d
 
     # ---- --anchor_coef (self-anchoring): dangerous transitions the episode survived ----

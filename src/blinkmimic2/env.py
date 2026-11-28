@@ -17,6 +17,7 @@ from mjlab.scene import Scene, SceneCfg
 from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
 
+from . import moe as moe_rules
 from . import recovery as recovery_rules
 from .dr import DomainRandCfg, DomainRandomizer, XiLayout
 from .mdp import MAX_STEP_REWARD, MDP, flatten_state
@@ -138,11 +139,13 @@ class TrackingSim:
     def __init__(self, sim_cfg: SimulationCfg, num_envs: int, robot: RobotSpec, motion: MotionLib, mdp: MDP,
                  device: str, gamma: float = 0.99, eval_mode: bool = False, max_episode_steps: int = 500,
                  reset_noise: bool = True, randomize: bool | None = None, fail_reset: float = 0.0, bin_fix: bool = False,
-                 recovery: recovery_rules.Recovery | None = None):  # fmt: skip
+                 recovery: recovery_rules.Recovery | None = None, tracking_target_flag: bool = False):  # fmt: skip
         """``randomize`` (default: not eval_mode) switches domain randomization, observation noise and
         delay, and pushes; ``eval_mode`` switches evaluation bookkeeping (no auto-reset, episode starts
         exactly on the reference). ``recovery`` (train.py's recovery options, recovery.py): recovery starts among the
-        sampled resets, and the reward and termination of recovery.advance."""
+        sampled resets, and the reward and termination of recovery.advance. ``tracking_target_flag`` (train.py --moe, with
+        ``recovery``): each world keeps whether its episode keeps the tracking mixing target (moe.tracking_target_at_reset), set at
+        its reset and stored with every transition (out["keeps_tracking_target"])."""
         self.device = device
         self.scene = Scene(make_scene_cfg(robot, num_envs), device=device)
         self.sim = Simulation(num_envs=num_envs, cfg=sim_cfg, model=self.scene.compile(), device=device)
@@ -223,6 +226,8 @@ class TrackingSim:
             zero = torch.zeros(self.N, dtype=torch.long, device=dev)
             self.regime = recovery_rules.start_state(zero, zero)
             self.recovery_episode = torch.zeros(self.N, dtype=torch.bool, device=dev)
+        assert not tracking_target_flag or recovery is not None, "tracking_target_flag needs recovery"
+        self.keeps_tracking_target = torch.zeros(self.N, dtype=torch.bool, device=dev) if tracking_target_flag else None
         self.reset(torch.arange(self.N, device=dev))
 
     @property
@@ -400,6 +405,9 @@ class TrackingSim:
             for k, v in recovery_rules.start_state(frames if body_frames is None else body_frames, frames).items():
                 self.regime[k][env_ids] = v
             self.recovery_episode[env_ids] = self.regime["recovering"][env_ids]
+            if getattr(self, "keeps_tracking_target", None) is not None:  # --moe: placed pelvis height against the command row's
+                self.keeps_tracking_target[env_ids] = moe_rules.tracking_target_at_reset(
+                    self.regime["recovering"][env_ids], p[:, 2], m.root_p[frames][:, 2])
 
     def use_static_focus(self):
         """Keep the focus distribution and share in fixed device tensors (updated in place by set_focus), so a captured
@@ -491,6 +499,9 @@ class TrackingSim:
             for k, v in recovery_rules.start_state(frames if body is None else body, frames).items():
                 self.regime[k].copy_(torch.where(d.view(-1, *([1] * (v.dim() - 1))), v, self.regime[k]))
             self.recovery_episode.copy_(torch.where(d, self.regime["recovering"], self.recovery_episode))
+            if getattr(self, "keeps_tracking_target", None) is not None:  # --moe: placed pelvis height against the command row's
+                flag = moe_rules.tracking_target_at_reset(self.regime["recovering"], p[:, 2], m.root_p[frames][:, 2])
+                self.keeps_tracking_target.copy_(torch.where(d, flag, self.keeps_tracking_target))
         self.ep_disc_ret.masked_fill_(d, 0.0)
         self.ep_ret.masked_fill_(d, 0.0)
         self.randomizer.reset_masked(self.xi, d)
@@ -633,6 +644,8 @@ class TrackingSim:
             out["cut"] = done | self._push(done)
         if self.recovery is not None:
             out.update(start, recovery_switch=switch, recovery_stop=stop)
+            if getattr(self, "keeps_tracking_target", None) is not None:  # --moe: the episode's flag, as the regime of s
+                out["keeps_tracking_target"] = self.keeps_tracking_target.clone()
             for k, v in regime.items():
                 self.regime[k].copy_(v)
         # bookkeeping
