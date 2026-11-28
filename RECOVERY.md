@@ -36,7 +36,7 @@ A **control** is one 0.02 s policy step (50 Hz); a **row** is one 0.02 s frame o
 | `--recovery_hidden_clips` | `fallAndGetUp1_subject1`, `fallAndGetUp1_subject5`, `fallAndGetUp2_subject2`, `fallAndGetUp2_subject3`, `fallAndGetUp3_subject1` | clips that give the start rows and the hidden reference | this repository's choice; StableMimic builds its get-up library from the retargeted LAFAN1 get-up subset (Section IV-A) and names no clips; `fallAndGetUp1_subject4`, a get-up recording of the library, is not a hidden clip |
 | `--recovery_command_excluded_clips` | the five hidden clips and `fallAndGetUp1_subject4` | clips that never give a command row | this repository's choice; in StableMimic commands come only from the LAFAN1 dance subset, apart from the get-up library (Section IV-A) |
 | `--recovery_low_pelvis HEIGHT UPZ` | 0.50 m, 0.5 | bounds of a low row | this repository's choice; StableMimic starts recovery from perturbed prone, supine and intermediate get-up rows (Section III-B) with no height or tilt rule, and uses 0.50 m and 60 degrees as the onset of a fall in its evaluation (Section IV-A) |
-| `--recovery_rows UPRIGHT_RUN LONGEST_SPAN COMMAND_UPRIGHT` | 50 (1 s), 375 (7.5 s), 500 | upright run that ends a get-up; longest span from a start row to its get-up end; upright rows ahead of a command row | this repository's choice; StableMimic starts the transition back to the command on similarity to the end of the get-up and gives no threshold (Section III-B) |
+| `--recovery_rows UPRIGHT_RUN LONGEST_SPAN COMMAND_UPRIGHT` | 50 (1 s), 375 (7.5 s), 500 | upright run that ends a get-up; longest span from a start row to its get-up end; upright rows ahead of a command row | this repository's choice; StableMimic starts its transition (this repository's blend) back to the command on similarity to the end of the get-up and gives no threshold (Section III-B) |
 | `--recovery_reward_scale` | 2.5 | factor on the six tracking terms while recovering | StableMimic, Section III-C, Table V |
 | `--recovery_seconds STOP BLEND` | 2.0 s (100 controls), 1.5 s (75 controls) | consecutive time of target error that stops a recovery episode; time of the blend | StableMimic, Section III-B, Table V, for the durations; counting consecutive controls is this repository's choice, as the paper does not say how persistence is counted |
 
@@ -159,9 +159,10 @@ whole rollout are then computed at the target rows, the critic's values at each 
 the squared pelvis height difference alone as its root position error (StableMimic, Section III-C, uses root
 height; the pelvis is the root and the anchor of this trainer). A blend control takes its blend weight, linear in
 the blend control (step 5 above), times the six terms; the paper gives neither the shape of this weight nor a value
-for its separate transition coefficient, and that coefficient is not applied here. A tracking control takes the release's terms. Outside recovery the root position error is taken
-against the command's root moved by `command_offset`; the body terms are anchored to the robot's planar position and
-heading in the release and need no offset. The action-rate and joint-limit terms and the imagined contact term keep
+for StableMimic's separate transition coefficient, and that coefficient is not applied here. A tracking control takes
+the release's terms. Outside recovery the root position error is taken against the command's root moved by
+`command_offset`; the body terms are anchored to the robot's planar position and heading in the release and need no
+offset. The action-rate and joint-limit terms and the imagined contact term keep
 their weights. Recovery rows can exceed the release's largest step reward (`MAX_STEP_REWARD`, 0.02 s times the sum
 of the six tracking-term weights), so `sim_rew`, `imag_rew` and `ep_ret_norm` of the log are not comparable between
 the two conditions.
@@ -211,6 +212,69 @@ saved, as in the release.
 control update matched in tracking exposure to an update of a recovery run is the first whose running total, 65,536
 times its update count, reaches that update's `recovery_imagined_tracking_total`.
 
+## Mixture-of-experts actor (`--moe`)
+
+`--moe`, given with the recovery options (refused without them), replaces the policy's decoder by StableMimic's
+mixture-of-experts (MoE) actor (Section III, Eq. 3, and the implementation-details table): two experts whose actions
+a mixing network (StableMimic's "gate") blends. It also adds the three mixing losses to the actor's loss.
+`src/blinkmimic2/moe.py` holds the mixing targets and the mixing losses, `networks.Policy` (`moe_prop_dim`) the
+networks. Without the option nothing changes: the policy has the
+same parameters, built from the same random draws; no buffer field, simulator tensor, log column or `args.json` key is
+added, and no random number is drawn.
+
+**Networks.** The motion encoder (goal to the 32-D latent z) is shared. The two experts, the tracking expert
+`expert_m` (commanded motion) and the recovery expert `expert_r`, each read what the decoder reads, z and the
+normalized 10-observation history, through the decoder's hidden widths halved (1024, 512, 256, 128 at the default
+`--dec_hidden`), or through the widths `--moe_expert_hidden` gives (needs `--moe`; absent from `args.json` without
+it). The mixing network `mixing_network` is an MLP (256, 128, ELU) on the first 93 entries of each of the 10
+normalized observations (joint positions and velocities, angular velocity, gravity in the body frame, previous action;
+`mdp.proprio_dim`), so 930 inputs: it reads no goal, latent or reference-relative root orientation (the observation's
+last 6 entries, the only ones that read the command row) and no regime. The mixing weights are
+`[w_m, w_r] = softmax(mix / 1.0)` and the action is `w_m mu_m + w_r mu_r`. The experts' last layers are scaled by 0.01
+as the decoder's; the mixing network's last layer starts at zero, so both experts start with mixing weight 1/2 for
+every input while the mixing network's hidden layers keep their random start. Muon takes the hidden matrices of the
+encoder, both experts and the mixing network, as it takes those of the encoder and decoder without the option. At the
+default widths on the 40 LAFAN1 clips the actor has 8,011,740 parameters with the option and 9,116,477 without
+(encoder 4,259,616; decoder 4,856,861; each expert 1,740,317; mixing network 271,490; printed by `tests/test_moe.py`).
+With full-width experts (`--moe_expert_hidden 2048,1024,512,256`) the actor has 14,244,828 parameters. The single
+network's decoder widths are set by `--dec_hidden`; with `--dec_hidden 3200,1600,800,400`, the narrowest widths in the
+default's 2:1 ratios (multiples of 8) at which the single network has at least as many parameters as that MoE actor,
+it has 14,267,645.
+
+**Mixing targets.** A control's label is its regime (Order inside a control). Its mixing target is `(1, 0)` for
+tracking, `(0, 1)` for recovery, and `(1 - y_r, y_r)` with `y_r = (left - 1) / BLEND` for a blend control with `left`
+blend controls still to run: one minus the control's reward weight, 74/75 at the first blend control and 0 at the
+last. A recovery start whose placed pelvis height is at least 0.8 of its command row's keeps the tracking label and
+mixing target for every control of its episode (StableMimic, Section III-C). The simulator sets that flag at each
+reset (`TrackingSim.keeps_tracking_target`, from the placed pelvis, after the reset noise), the buffer stores it with
+every transition (`keeps_tracking_target`) and an imagined rollout takes the flag of its start.
+
+**Mixing losses**, on the 32 imagined controls of each rollout of the policy update, each weighted by the control's
+survival weight (the product of `1 - d` of the preceding controls, without gradient), as termination ends a simulator
+rollout:
+
+| Term | Weight | Definition |
+| --- | --- | --- |
+| mixing cross-entropy | 0.1 | `-(y_m log w_m + y_r log w_r)`, times 4 on blend-labelled controls, survival-weighted mean over all controls. The 4 is StableMimic's "transition 4.0", read here as the weight of blend controls (StableMimic's transition is this repository's blend); the paper does not define it |
+| mixing consistency | 0.01 | `(w_r(t+1) - w_r(t))^2` over consecutive controls of a rollout with equal labels, mean weighted by the later control's survival |
+| expert alignment | 0.01 | mean over the 29 action dimensions of `(mu_m - mu_r)^2` on blend-labelled controls, survival-weighted mean (0 without one) |
+
+For these terms the mixing network and the experts are evaluated a second time on the imagined histories without
+gradient to the world model's rollout (`moe.rollout_mixing_losses`): the labels train the mixing network and the
+experts and do not move the preceding actions towards states that look like their label. The action blend inside the
+rollout keeps its gradient, so the actor objective trains the mixing network as well. The paper gives no temperature,
+no form of the consistency and alignment terms and no normalization; these are this repository's choices.
+
+**Log.** `train_log.csv` gets, per log row: `mixing_weight_recovery_expert_tracking`, `_recovery`, `_blend` (the mean
+mixing weight `w_r` of the recovery expert over the imagined controls of each regime, by the control's regime, flag or
+not; empty where the regime did not occur), `mixing_cross_entropy`, `mixing_consistency`, `expert_alignment` (the mean
+of each unweighted term over the updates), and `recovery_share_keeping_tracking_target` (the share of the imagined
+recovery controls whose episode keeps the tracking target).
+
+**Checkpoints and tools.** `args.json` and the checkpoints' `args` hold `"moe": true`; `networks.policy_kwargs` builds
+the experts and the mixing network from it, so `tools/rollouts.py`, `tools/evaluate.py`, `tools/record_clips.py` and
+`tools/avg_ckpt.py` read such a checkpoint as any other. The exported policy is one network; it reads no regime.
+
 ## Known limit: the pelvis heading
 
 The release takes a heading frame from the horizontal projection of the pelvis x axis (`rotations.yaw_mat`). Measured
@@ -225,7 +289,7 @@ unchanged; `recovery_start_low_heading_share` gives the share of recovery starts
 
 | StableMimic | This repository |
 | --- | --- |
-| two experts whose actions a mixing network on proprioception blends, trained with extra mixing losses (Sections III-A, III-C) | one policy network |
+| two experts whose actions a mixing network on proprioception blends, trained with extra mixing losses (Sections III-A, III-C) | one policy network; the two experts and the mixing network with `--moe` (above) |
 | trained by PPO (Section III-D) | trained through rollouts imagined in a learned dynamics model, closed by a critic |
 | start frames half uniform, half weighted towards failed phases (Section III-B) | start rows uniform |
 | a success term in the reward, not defined further (Section III-C) | no success term |

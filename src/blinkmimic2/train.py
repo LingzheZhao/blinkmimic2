@@ -132,6 +132,14 @@ parser.add_argument("--recovery_reward_scale", type=float, default=argparse.SUPP
 parser.add_argument("--recovery_seconds", type=float, nargs=2, default=argparse.SUPPRESS, metavar=("STOP", "BLEND"),
                     help="consecutive seconds of target error that stop a recovery episode; seconds of the blend back to "
                          "the command")
+# ---- mixture-of-experts (MoE) actor (moe.py, RECOVERY.md): needs the recovery options (absent from args.json without it) ----
+parser.add_argument("--moe", action="store_true", default=argparse.SUPPRESS,
+                    help="StableMimic's mixture-of-experts actor (two experts blended by a mixing network on "
+                         "proprioception) with the mixing losses (needs the recovery "
+                         "options)")
+parser.add_argument("--moe_expert_hidden", type=str, default=argparse.SUPPRESS,
+                    help="hidden widths of each MoE expert (needs --moe; default: every --dec_hidden width halved, "
+                         "1024,512,256,128 at the default --dec_hidden)")
 args = parser.parse_args()
 if args.motion_dir and args.bones_list:
     parser.error("--motion_dir is read only with an empty --bones_list (--bones_list=)")
@@ -154,12 +162,17 @@ from blinkmimic2.objective import actor_objective
 from blinkmimic2.mdp import flatten_state
 from blinkmimic2.robot import get_robot
 from blinkmimic2.sensing import ObsPipeline
-from blinkmimic2 import recovery
+from blinkmimic2 import moe, recovery
 
 try:
     REC_SETTINGS = recovery.settings_from_args(args)
 except ValueError as e:
     parser.error(str(e))
+MOE = getattr(args, "moe", False)  # --moe
+if MOE and REC_SETTINGS is None:
+    parser.error("--moe needs the recovery options: the mixing targets come from the regime of each imagined control")
+if getattr(args, "moe_expert_hidden", None) is not None and not MOE:
+    parser.error("--moe_expert_hidden needs --moe")
 if REC_SETTINGS is not None:  # options that read the command row as if the body followed it (RECOVERY.md)
     _refused = {"--exam_frac != 0": args.exam_frac != 0, "--front_share != 0": args.front_share != 0,
                 "--fail_penalty != 0": args.fail_penalty != 0, "--wstream_frac != 0": args.wstream_frac != 0,
@@ -255,6 +268,9 @@ if REC is not None:  # recovery log columns, summed on the device by the capture
     IM_COUNTS = torch.zeros(3, dtype=torch.long, device=dev)  # imagined controls by the regime they start in
     IM_SURVIVAL = torch.zeros(2, device=dev)  # survival to the horizon summed over recovery starts, their count
     IM_TRACKING_TOTAL = [0]  # imagined tracking-regime controls since the start of the run
+if MOE:  # --moe log columns: per regime the summed recovery-expert weight and the control count (tracking, recovery,
+    # blend), the summed three losses, the updates, and the recovery controls with the episode's tracking target
+    MOE_STATS = torch.zeros(moe.STATS, device=dev)
 print(f"critic value bound V_max = {VMAX:.4g}", flush=True)
 GRAPH = True
 assert not pipe.stateful, "CUDA graphs: not with stateful sensing"
@@ -264,7 +280,7 @@ fused = ({"fused": True})
 adam_kw = lambda: ({"fused": True, "capturable": True, "lr": torch.tensor(args.lr, device=dev)})  # noqa: E731
 from blinkmimic2.optim import MuonAdam
 opt_wm = MuonAdam(wm, [wm.net], lr=args.lr, betas=(0.9, 0.999), fused=True, capturable=GRAPH)
-opt_pi = MuonAdam(pi, [pi.enc, pi.dec], lr=args.lr, betas=(args.pi_beta1, 0.95), fused=True, capturable=GRAPH)
+opt_pi = MuonAdam(pi, pi.mlps(), lr=args.lr, betas=(args.pi_beta1, 0.95), fused=True, capturable=GRAPH)
 NONFINITE = torch.zeros((), dtype=torch.long, device=dev)  # skipped non-finite policy updates
 pi_avg = torch.optim.swa_utils.AveragedModel(pi, multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(args.pi_ema),
                                              use_buffers=True) if args.pi_ema > 0 else None  # fmt: skip
@@ -351,6 +367,21 @@ def _imag_step_sensed(S, o_hist, a_prev, f, xi, xi_n, g, st):
     return S1, a, o_hist, f1, motion.goal(f1, K), st
 
 
+def _imag_step_moe(S, o_hist, a_prev, f, xi, xi_n, g):
+    """``_imag_step`` with the MoE actor (--moe); also returns the motion latent z and the normalized history o
+    the action was computed from."""
+    a, z, o, _ = pi.moe_forward(o_hist, g)
+    S1 = wm.step(S, a, a_prev, xi_n)
+    f1 = f + 1
+    o1 = mdp.add_noise(mdp.obs(S1, a, xi, f1))
+    o_hist = torch.cat((o_hist[:, 1:], o1.unsqueeze(1)), 1)
+    return S1, a, o_hist, f1, motion.goal(f1, K), z, o
+
+
+def _moe_losses(Z, O, label, y_r, survival):
+    return moe.rollout_mixing_losses(pi, Z, O, label, y_r, survival)
+
+
 def _reward_term(S, f, a, a_prev):
     return mdp.reward(S, f, a, a_prev, w_contact=args.contact_reward), mdp.soft_termination(S, f, scale=1.0)
 
@@ -389,6 +420,8 @@ wm_err = torch.compile(_wm_err)
 imag_step = torch.compile(_imag_step)
 imag_step_z = torch.compile(_imag_step_z)
 imag_step_sensed = torch.compile(_imag_step_sensed)
+imag_step_moe = torch.compile(_imag_step_moe)
+moe_losses_c = torch.compile(_moe_losses)
 reward_term = torch.compile(_reward_term)
 reward_term_recovery = torch.compile(_reward_term_recovery)
 critic_input_c = torch.compile(_critic_input)
@@ -547,6 +580,9 @@ def policy_update():
     Ss, As, Aps, Fs, Gs = [], [], [], [], []
     if REC is not None:  # recovery: the regime of each imagined state, from the regime stored with the start
         Regs, Rows, Scales, Stops = [{k: s[k] for k in recovery.KEYS}], [], [], []
+    if MOE:  # the latent and the normalized history of each imagined control
+        Zs, Os = [], []
+        assert not BGE and not pipe.stateful, "--moe: the imagined step of _imag_step_moe only"
     if BGE and not pipe.stateful:
         # the goals of an imagined rollout depend only on the reference frames f, f+1, ..., f+H, so they and the motion
         # latents are computed once for the whole horizon: one large GEMM chain instead of H small ones (same gradient)
@@ -561,6 +597,9 @@ def policy_update():
             S, a_prev, o_hist, f, g, st = imag_step_sensed(S, o_hist, a_prev, f, xi, xi_n, g, st)
         elif BGE:
             S, a_prev, o_hist, f, g = imag_step_z(S, o_hist, a_prev, f, xi, xi_n, G_all[t], Z_all[t], G_all[t + 1])
+        elif MOE:
+            S, a_prev, o_hist, f, g, z_t, o_t = imag_step_moe(S, o_hist, a_prev, f, xi, xi_n, g)
+            Zs.append(z_t), Os.append(o_t)
         else:
             S, a_prev, o_hist, f, g = imag_step(S, o_hist, a_prev, f, xi, xi_n, g)
         Ss.append(S), As.append(a_prev), Fs.append(f), Gs.append(g)
@@ -640,9 +679,17 @@ def policy_update():
             IM_SURVIVAL.add_(torch.stack(((c.detach() * rec0).sum(), rec0.sum())))
     r_sum = (c_t * r_log).detach().sum(0)
     loss = -(J).mean()
+    loss_pi = loss
+    if MOE:  # the mixing losses on the imagined controls, labelled by the regime each starts in (RECOVERY.md)
+        with torch.no_grad():
+            label, y_r = moe.mixing_targets(reg_t == recovery.RECOVERY, torch.stack([R["blend_left"] for R in Regs[:-1]]),
+                                     REC.settings.blend_controls, s[moe.FLAG].unsqueeze(0))
+        ce, consistency, alignment, w_r = moe_losses_c(torch.stack(Zs), torch.stack(Os), label, y_r, c_t.detach())
+        loss_pi = loss + moe.total(ce, consistency, alignment)
+        MOE_STATS.add_(moe.stats(w_r, reg_t, s[moe.FLAG].unsqueeze(0), ce, consistency, alignment))
     opt_pi.zero_grad(set_to_none=True)
     CLIP_STATS.clear()
-    loss.backward()
+    loss_pi.backward()
     if CLIP_STATS:  # share of live samples whose adjoint was scaled down, over all hooked tensors and imagined steps
         CLIP_FRAC[0] = torch.stack([a for a, _ in CLIP_STATS]).sum() / torch.stack([b for _, b in CLIP_STATS]).sum().clamp(min=1)
     gn = nn.utils.clip_grad_norm_(pi.parameters(), 1.0)
@@ -678,7 +725,7 @@ sim_cfg = make_sim(robot)
 mdp.reward, mdp.termination, mdp.obs = torch.compile(mdp.reward), torch.compile(mdp.termination), torch.compile(mdp.obs)
 motion.goal = torch.compile(motion.goal)
 env = TrackingSim(sim_cfg, args.num_envs, robot, motion, mdp, dev, gamma=args.gamma, fail_reset=args.fail_reset, bin_fix=True,
-                  recovery=REC)
+                  recovery=REC, **({"tracking_target_flag": True} if MOE else {}))
 env.aprev_ref = args.reset_aprev_ref
 if PHASE:
     env.aprev_gate = torch.ones((), dtype=torch.bool, device=dev)
@@ -893,7 +940,7 @@ if N_EX:
              f"{50} its, share {0.0})" if False else ""), flush=True)  # fmt: skip
 buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev, J, layout.dim,
                       mdp.obs_dim if pipe.stateful else None, pipe.state_dim if pipe.stateful else None, danger=False,
-                      recovery=REC is not None)  # fmt: skip
+                      recovery=REC is not None, **({"tracking_target_flag": True} if MOE else {}))  # fmt: skip
 obs_hist = torch.zeros(args.num_envs, Hh, mdp.obs_dim, device=dev)
 if args.start_prac_frac >= 0:
     assert 0 < N_EX < args.num_envs, "--start_prac_frac needs --exam_frac in (0, 1)"
@@ -1270,6 +1317,10 @@ if REC is not None:  # RECOVERY.md, Records
                     "recovery_imagined_share_tracking,recovery_imagined_share_recovery,recovery_imagined_share_blend,"
                     "recovery_imagined_tracking_total,recovery_imagined_survival_recovery_starts,"
                     "recovery_clamped_share_values,recovery_clamped_share_targets,recovery_clamped_share_bootstrap")
+if MOE:  # RECOVERY.md, Mixture-of-experts actor
+    anchor_cols += (",mixing_weight_recovery_expert_tracking,mixing_weight_recovery_expert_recovery,"
+                    "mixing_weight_recovery_expert_blend,mixing_cross_entropy,mixing_consistency,expert_alignment,"
+                    "recovery_share_keeping_tracking_target")
 log_f.write("iteration,wall_h,sim_steps,wm_loss,wm_err8,pi_loss,v_loss,imag_rew,pi_gradnorm,imag_survival,sim_rew,ep_len,ep_ret_norm,term_frac,it_per_s,lr"
             + anchor_cols + ",pi_lr,pi_mult,nonfinite\n")  # fmt: skip
 log_f.flush()
@@ -1358,6 +1409,12 @@ for it in range(start_it, args.iterations):
             row += ([share(sc[1], sc[0]), share(sc[2], sc[1])] + [share(x, sum(sc[3:6])) for x in sc[3:6]] + sc[6:8]
                     + [share(x, sum(ic)) for x in ic] + [IM_TRACKING_TOTAL[0], share(sv[0], sv[1])]
                     + [share(x, vr[3]) for x in vr[:3]])
+        if MOE:  # the columns of anchor_cols
+            ms = MOE_STATS.tolist()
+            MOE_STATS.zero_()
+            share = lambda x, n: x / n if n else float("nan")  # noqa: E731
+            row += ([share(ms[2 * i], ms[2 * i + 1]) for i in range(3)] + [share(x, ms[9]) for x in ms[6:9]]
+                    + [share(ms[10], ms[3])])
         extra = [lr * pi_mult, float(pi_mult), int(NONFINITE)] if LOG_EXTRA else []
         log_f.write(",".join(f"{x:.6g}" if isinstance(x, float) else str(x) for x in row + extra) + "\n")
         log_f.flush()
